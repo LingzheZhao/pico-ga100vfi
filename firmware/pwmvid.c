@@ -682,7 +682,7 @@ int main(void) {
         else if (c == 'v') {
 #ifdef DEBUG
             nvvdd_refresh();
-            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s\n",
+            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-debug\n",
                    clock_get_hz(clk_sys) / 1000000,
                    nvvdd_v, sample_ns, reset_note);
 #else
