@@ -77,8 +77,19 @@ def snapshot(bar) -> dict[str, int]:
     return {name: bar.rd32(off) for name, off in SHADOW.items()}
 
 
+FUSECTRL = 0x00820000
+POISON_TAG = 0xBADF0000
+
+
 def classify(bar, baseline: dict[str, int] | None = None) -> Verdict:
-    """Run checks 3-8. Leaves DSOV set to 1 if check 5 succeeds."""
+    """Run checks 3-8. Leaves DSOV set to 1 if check 5 succeeds.
+
+    Read FUSECTRL first. A disturbed fuse read can leave the controller at 0xBADFxxxx; more BAR0 reads
+    on such a card are a host-hang risk.
+    Poisoned -> read nothing else, report an over-glitched shot (priv_mask 0 marks it); the next PEX_RST clears it."""
+    ctrl = bar.rd32(FUSECTRL)
+    if (ctrl & 0xFFFF0000) == POISON_TAG:
+        return Verdict(0, UNREADABLE, 0, 0, 0, {"FUSECTRL_POISONED": ctrl}, {})
     dsov = bar.rd32(DSOV)
     fpf = bar.rd32(FPF_ROW)
     bar.wr32(DSOV_SET, 1)

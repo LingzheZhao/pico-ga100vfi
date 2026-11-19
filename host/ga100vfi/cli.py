@@ -116,7 +116,7 @@ def cmd_campaign(args) -> int:
                 outcome = "lost"
                 if restore(args.bdf, wait_s=args.restore_wait):
                     with Bar0(args.bdf) as bar:
-                        if bar.rd32(0x00) != 0xFFFFFFFF:
+                        if bar.rd32(0x00820000) != 0xFFFFFFFF:  # FUSECTRL, not PMC_BOOT_0 (poison-safe)
                             v = classify(bar)
                             outcome = _classify_attempt(v)
                 if outcome == "lost":
