@@ -5,6 +5,8 @@
 3. read DSOV (0x00820084); continue unless it reads 0
 4. read an FPF row (0x00824314); continue if it reads 0xffffffff
 5. write DSOV = 1 (0x00820040), read back; continue unless it reads 1
+   (0x00820040 is EN_SW_OVERRIDE and keeps its value across PEX_RST; the write
+   is opt-in, see classify())
 6. dump the shadow fuse registers and compare with the baseline (logged only)
 7. read NV_FUSE_OPT_PRIV_LEVEL_MASK (0x008200fc); Goldilocks reads 0xffffffff
    (both PLMs wide open, so the shadow option words are writable)
@@ -14,6 +16,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 DSOV = 0x00820084
@@ -44,16 +47,22 @@ class Verdict:
     crc_status: int
     shadow: dict[str, int] = field(default_factory=dict)
     shadow_diff: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # False when classify() did not write 0x00820040: dsov_writeback is then only
+    # a read of that register and check 5 is left out of `checks`.
+    dsov_written: bool = True
 
     @property
     def checks(self) -> dict[str, bool]:
-        return {
+        c = {
             "dsov_zero": self.dsov == 0,
             "fpf_readable": self.fpf_row != UNREADABLE,
             "dsov_settable": self.dsov_writeback == 1,
             "priv_mask_open": self.priv_mask == 0xFFFFFFFF,
             "crc_valid": self.crc_status == CRC_GOOD,
         }
+        if not self.dsov_written:
+            del c["dsov_settable"]
+        return c
 
     @property
     def passed(self) -> bool:
@@ -66,6 +75,7 @@ class Verdict:
             "dsov": self.dsov,
             "fpf_row": self.fpf_row,
             "dsov_writeback": self.dsov_writeback,
+            "dsov_written": self.dsov_written,
             "priv_mask": self.priv_mask,
             "crc_status": self.crc_status,
             "shadow": self.shadow,
@@ -81,18 +91,35 @@ FUSECTRL = 0x00820000
 POISON_TAG = 0xBADF0000
 
 
-def classify(bar, baseline: dict[str, int] | None = None) -> Verdict:
-    """Run checks 3-8. Leaves DSOV set to 1 if check 5 succeeds.
+def _poisoned(value: int) -> bool:
+    return (value & 0xFFFF0000) == POISON_TAG
+
+
+def classify(bar, baseline: dict[str, int] | None = None, write: bool | None = None) -> Verdict:
+    """Run checks 3-8.
 
     Read FUSECTRL first. A disturbed fuse read can leave the controller at 0xBADFxxxx; more BAR0 reads
-    on such a card are a host-hang risk.
-    Poisoned -> read nothing else, report an over-glitched shot (priv_mask 0 marks it); the next PEX_RST clears it."""
+    on such a card are a host-hang risk. Poisoned -> read nothing else, report an over-glitched shot
+    (priv_mask 0 marks it). The same holds when DSOV itself reads 0xBADFxxxx behind a healthy FUSECTRL:
+    the verdict carries that DSOV value and nothing after it is read or written. On the cards tested a
+    poisoned controller stayed poisoned until a power cycle, so later shots of the same boot read
+    poisoned too.
+
+    Check 5 writes 1 to 0x00820040 (EN_SW_OVERRIDE). That register keeps its value across PEX_RST, so
+    after one such write every later shot of the boot runs with the software override on. The write
+    happens only with write=True, or with CLASSIFY_WRITE=1 in the environment when write is None.
+    Without it 0x00820040 is only read, and check 5 is left out of Verdict.checks."""
+    if write is None:
+        write = os.environ.get("CLASSIFY_WRITE") == "1"
     ctrl = bar.rd32(FUSECTRL)
-    if (ctrl & 0xFFFF0000) == POISON_TAG:
+    if _poisoned(ctrl):
         return Verdict(0, UNREADABLE, 0, 0, 0, {"FUSECTRL_POISONED": ctrl}, {})
     dsov = bar.rd32(DSOV)
+    if _poisoned(dsov):
+        return Verdict(dsov, UNREADABLE, 0, 0, 0, {"DSOV_POISONED": dsov}, {})
     fpf = bar.rd32(FPF_ROW)
-    bar.wr32(DSOV_SET, 1)
+    if write:
+        bar.wr32(DSOV_SET, 1)
     writeback = bar.rd32(DSOV_SET)
     priv = bar.rd32(PRIV_MASK)
     crc = bar.rd32(CRC_STATUS)
@@ -100,4 +127,4 @@ def classify(bar, baseline: dict[str, int] | None = None) -> Verdict:
     diff = {}
     if baseline:
         diff = {k: (baseline.get(k), v) for k, v in shadow.items() if baseline.get(k) != v}
-    return Verdict(dsov, fpf, writeback, priv, crc, shadow, diff)
+    return Verdict(dsov, fpf, writeback, priv, crc, shadow, diff, write)
