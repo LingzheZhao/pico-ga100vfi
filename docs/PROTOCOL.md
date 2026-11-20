@@ -17,7 +17,8 @@ back to PWM-VID mode 500 ms after the dip; set `revert=0` to skip that wait and 
 the rail in PMBus mode at the stock voltage — much faster for campaigns (the GA100
 runs fine on the fixed voltage; call `w` to hand back at the end).
 
-Lab knobs (experimental, `fw=lab-psr1-push1`, not run on hardware yet). With
+Lab knobs (since `fw=lab-psr1-push1`; fast subsets, dither and SCL hold were run on
+one card in 2026-11). With
 `fast` 0 or 1, `t_restore` above -1000, `revert` 0 or 1 and `hold_ms` 0 the timeline
 is the same as before:
 
@@ -26,10 +27,21 @@ is the same as before:
 | `fast` | 0 / 1 | stock slew / whole fast profile, as before |
 | `fast` | 2..7 | one subset of the fast profile: 2 = `0x30` + `0x32`, 3 = `0x30`, 4 = `0x32`, 5 = `0xBA`, 6 = `0xB9`, 7 = `0x45` (`0x31` only with 1). The card's six values are still captured before and restored after. Other values abort: `glitch ABORT: fast=<n>, use 0..7` |
 | `t_restore_us` | ≤ -1000 | longer `PEX_RST` lead: reset and the 600 mV setup write move from -1000 to `t_restore` (setup writes at `t_restore` - 300 / - 200), so a dip that starts before -1000 is not overwritten. `t_restore` then counts as -20 for an automatic `pw`. Below -20000 aborts: `glitch ABORT: reset lead <n> us, use -20000..-1000` |
-| `revert` | 2 | one-VID dither: odd pulses are one VID code (6.25 mV) shallower than `v_dip`, with no restore and no gap between pulses, so the command steps between the two codes every `pw`; `v_restore` follows the last pulse. No hand-back (as `revert=0`). Keep `pw` at or above one write (~47 µs measured) or the writes run late |
-| `hold_ms` | > 0 | if the train's last write is scheduled before t = 0, SCL is held low from t = 0 for `hold_ms` and the stock restore (`VOUT` `0x7E`, `VOUT_MIN` `0x30`) waits for the hold to end, so the rail stays at `v_restore` meanwhile; a write still in flight at t = 0 delays the hold start. A train that writes after t = 0 keeps the old hold (after the stock restore) |
+| `revert` | 2 | one-VID dither: odd pulses are one VID code (6.25 mV) shallower than `v_dip`, with no restore and no gap between pulses, so the command steps between the two codes every `pw`; `v_restore` follows the last pulse. No hand-back (as `revert=0`). Since push2 the dither `pw` is floored at 47 µs (one measured write) |
+| `hold_ms` | > 0 | if the train's last write is scheduled before t = 0, SCL is held low from t = 0 for `hold_ms`; release waits up to 200 µs for SCL to read high (a failure stops the shot), and the stock restore (`VOUT` `0x7E`, retried for up to 500 µs, then `VOUT_MIN` `0x30`) runs 200 µs after the end of the hold, so the rail stays at `v_restore` meanwhile. A train that writes after t = 0 keeps the old hold (after the stock restore): the echo says `hold_at=post` and a `glitch WARN: hold_at=post ...` line follows. The profile restore waits 200 µs after any hold |
 
 The 36 µs `pw`/`gap` floor stays; the echo below prints the resolved `pw` and `gap`.
+
+Refused before anything is written (since push2, `fw=lab-psr1-push2`):
+a VOUT step before the 600 mV setup write (`glitch ABORT: VOUT step at <t> us is
+overwritten by the setup write at <reset_at> us`), and any PMBus write in flight across
+t = 0, counting ~47 µs per write and the queueing of back-to-back writes (`glitch ABORT:
+PMBus write act=<n> scheduled at <t> us runs from <start> us across the PEX_RST release at
+0`). One card's partial-state shape (`td` +30, `pw` 36, `delay` 117) is refused this way:
+its restore write queues to -40 µs and runs past the release, which the old step loop
+measured as a +9 µs late release. A tainted or failed profile capture, a failed profile
+write (except the full profile's `0x31` write, which this controller refuses) and a
+priming alarm that did not fire also abort, after restoring any profile already written.
 
 Reaching the Goldilocks fuse state (DSOV=0, CRC_STATUS=0x55, PLMs=0xffffffff) needs a
 **three-pulse** waveform (`pulses=3`) at a **shallow** dip: a single dip, or a deep
@@ -54,21 +66,36 @@ On entry the firmware echoes the resolved parameters:
 glitch vd=<n> td=<n> vr=<n> tr=<n> tv=<n> fast=<n> hold=<n> pw=<n> gap=<n> delay=<n> revert=<n> reset_at=<n> dither=<0|1> hold_at=<none|release|post>
 ```
 
-Any VOUT step scheduled before the setup write is overwritten by it, and is flagged:
+Since push2 the echo and every line below are printed after the shot, so no USB
+traffic is queued around t = 0. Two PMBus writes scheduled less than one write apart
+are reported (the second one runs late):
 
 ```
-glitch WARN: VOUT step at <signed_us> us precedes the setup write at <reset_at> us and is overwritten
+glitch WARN: PMBus writes at <t1> and <t2> us are <d> us apart (one write ~47 us); the second runs late
 ```
 
-`PEX_RST` release at t = 0 is not a timeline step: a hardware alarm (highest IRQ
-priority, core 0) releases the pin at the scheduled time even while a PMBus write is
-in flight. Before the shot the firmware warns about every scheduled PMBus write whose
-window `[t, t + 47 us)` contains t = 0 (47 us is one write as measured on one bench
-on 2026-11-20; the `pw`/`gap` floor stays 36 us):
+`PEX_RST` release at t = 0 is not a timeline step: a hardware alarm releases the pin
+at the scheduled time even while a PMBus write is in flight. Its handler is installed
+directly on the alarm IRQ (highest priority, core 0) and runs from SRAM with no flash
+code on the path; core 1 busy-waits instead of using the SDK alarm pool. The alarm is
+armed by the assert step itself, after the pin is low, so it can never release a card
+that was not put in reset; an assert that starts more than one write late fails the
+shot. Before every shot a throwaway alarm (pin already high-Z) exercises the IRQ path;
+how late it ran is printed as `prime_at=<us>` (with push1 on one bench on 2026-11-20 the
+first release of every boot was +9..+10 µs, later shots 0..2 µs; with push2 the first
+release of three fresh boots read 0).
+
+The timeline stops at its first failed action. The firmware then writes the stock rail
+(`VOUT` `0x7E`, `VOUT_MIN` `0x30`) while the card is still held in reset if the release
+has not happened yet, releases `PEX_RST`, restores the profile and reports:
 
 ```
-glitch WARN: PMBus write act=<n> at <signed_us> us overlaps the PEX_RST release at 0 (one write ~47 us)
+glitch FAIL: step i=<n> act=<n> scheduled=<t> failed; timeline stopped, safe rail vout=<0|1> vmin=<0|1>, PEX_RST released
+glitch FAIL: VRM profile restore or readback failed; power-cycle the card
 ```
+
+The profile restore writes back only the registers the `fast` value touched and reads
+them back against the capture.
 
 The timing diagnostic emits one record per action after the waveform and profile
 restoration, before the completion response:
@@ -77,15 +104,18 @@ restoration, before the completion response:
 timing i=<n> scheduled=<signed_us> act=<n> arg=<n> start=<signed_us> end=<signed_us> ok=<0|1>
 ```
 
-Times are relative to the scheduler reference. Reset assertion is act 3. These
+Records are printed for the actions that ran. Act 9 is the stock VOUT write after a
+hold from the release, retried for up to 500 µs. Times are relative to the scheduler
+reference. Reset assertion is act 3. These
 measure software call timing, not physical rail or reset thresholds. Timestamp
 overhead perturbs timing. See [TIMING_DIAGNOSTIC.md](TIMING_DIAGNOSTIC.md).
-After the records, one line gives the time the release alarm ran (`via=alarm`), or
-the time of the unconditional release after the timeline if the alarm did not run
-(`via=fallback`; not expected):
+After the records, the priming alarm and then the release: the time the release alarm
+ran (`via=alarm`), the release after a failed action (`via=abort`), or the release after
+the timeline if the alarm did not run (`via=fallback`; not expected):
 
 ```
-release_at=<signed_us> scheduled=0 via=<alarm|fallback>
+prime_at=<us late>
+release_at=<signed_us> scheduled=0 via=<alarm|abort|fallback>
 ```
 
 After the profile restoration and the 30 ms settle the firmware reads READ_VOUT
@@ -106,7 +136,8 @@ glitch done pwd=<0|1> e1=0x<hhhh> nvvdd=<v.vvvv> writes_failed=<n>
 ```
 
 `pwd` is the VRM unlock state, `e1` the MP2888 status word, `writes_failed` the
-count of PMBus writes that NACKed during the timeline (0 = bus healthy). `nvvdd`
+count of failed actions: the timeline action that stopped the shot, failed safe-rail
+writes and a failed profile restore or readback (0 = everything ran). `nvvdd`
 is the captured-rail average and is **present only in the debug build**
 (`-DDEBUG=ON`); the normal build omits it.
 
@@ -116,7 +147,7 @@ is the captured-rail average and is **present only in the debug build**
 |---|---|
 | `u` | Unlock the MP2888B (password `0x7C25`) |
 | `z` | Lock status → `cml=0x<hh> pwd=<0|1> e1=0x<hh><hh> vout=0x<hh><hh>` |
-| `v` | Status → debug build: `clk=<n> MHz  nvvdd=<v.vvvv> V  sample_ns=<f>  last reset: <…> fw=lab-psr1-push1-debug`; normal build: `clk=<n> MHz  last reset: <…> fw=lab-psr1-push1` |
+| `v` | Status → debug build: `clk=<n> MHz  nvvdd=<v.vvvv> V  sample_ns=<f>  last reset: <…> fw=lab-psr1-push2-debug`; normal build: `clk=<n> MHz  last reset: <…> fw=lab-psr1-push2` |
 | `y` | NVVDD trace → header `trace n=<n> sample_ns=<f>` then `<n>` hex samples; `trace: built without DEBUG` in the normal build |
 | `w` | Revert |
 | `k` / `K` | Apply `fast` / `stock` MP2888B transient-response profile |
@@ -127,7 +158,8 @@ is the captured-rail average and is **present only in the debug build**
 Every `u` then writes reg `0x13` = `0x00` and config ID `0x46` = `0x1229`, reads both
 back and prints `unlock <MATCH|LOCKED|ERR> wp=<hh|ERR> cfg=<hhhh|ERR>[ write=ERR]`
 (`unlock MATCH wp=00 cfg=1229` on a healthy controller). Before, both writes were
-skipped when the controller already reported MATCH.
+skipped when the controller already reported MATCH. Since push2 every `u` also forgets
+the VRM profile captured for fast shots, so a capture never carries over to another card.
 
 ## PMBus over the bridge
 
@@ -151,9 +183,11 @@ skipped when the controller already reported MATCH.
 
 - `PEX_RST` is only ever driven **low**, then released to high-Z (the net is 1.8 V
   push-pull; driving it high would put 3.3 V on it).
-- Every glitch timeline ends with the release alarm cancelled and `PEX_RST`
-  released, and the assert step is skipped if the release has already run, so a
-  shot cannot leave the card held in reset.
+- The release alarm is armed only after `PEX_RST` is low, and every glitch timeline
+  ends with the alarm cancelled and `PEX_RST` released, so a shot can neither release
+  an unreset card on schedule nor leave the card held in reset.
+- A failed timeline action stops the shot: the stock rail is written (while the card
+  is still in reset when possible) before `PEX_RST` is released.
 - After the dip the firmware restores `VOUT_COMMAND` to the stock code and hands the
   rail back to PWM-VID mode, so an interrupted run cannot leave NVVDD low.
 - The NVVDD ADC is read-only and never gates actuation, so the sense wire

@@ -1,11 +1,11 @@
 # Timing telemetry
 
 This build records when each step of a glitch timeline really ran. `v` reports it as `fw=lab-psr1-timing1`
-(normal build) or `fw=lab-psr1-timing1-debug`.
+(normal build) or `fw=lab-psr1-timing1-debug`. The release patches on top of it report `fw=lab-psr1-push1`
+(patches 0006 to 0008) and `fw=lab-psr1-push2` (patch 0009), with `-debug` in the debug build.
 
-The experimental build on top of it (`fw=lab-psr1-push1`, `fw=lab-psr1-push1-debug`; not run on hardware yet)
-releases `PEX_RST` from a hardware alarm instead of a timeline step. Its records have no act 4; a
-`release_at=<signed_us> scheduled=0 via=<alarm|fallback>` line follows them.
+push1 and push2 release `PEX_RST` from a hardware alarm instead of a timeline step. Their records have no
+act 4; a `release_at=<signed_us> scheduled=0 via=<alarm|abort|fallback>` line follows them (`abort` since push2).
 
 Each step records the start and end of its call and whether it succeeded, in RAM. After the waveform and the
 profile restore, and before the `glitch done` line, the firmware prints one line per step:
@@ -15,10 +15,12 @@ timing i=0 scheduled=-1300 act=8 arg=32 start=-1300 end=-1264 ok=1
 ```
 
 The line above shows the format, not a measured result. Times are signed microseconds relative to the scheduler's
-reference (t = 0 is the scheduled `PEX_RST` release). Act 1 writes `VOUT_COMMAND`, act 3 asserts `PEX_RST` low and
-act 4 releases it to input. These are software call times: they do not measure the physical reset edge or the rail.
-Taking the timestamps adds a little time to every step; nothing is printed inside the loop. Normal and debug builds
-carry the same instrumentation, outside the ADC code.
+reference (t = 0 is the scheduled `PEX_RST` release). Act 1 writes `VOUT_COMMAND` and act 3 asserts `PEX_RST` low.
+Since push1 the release is not an action: a hardware alarm releases the pin at t = 0 and a
+`release_at=<signed_us> scheduled=0 via=<alarm|abort|fallback>` line follows the records (push2 adds `prime_at=`
+before it and prints records only for the actions that ran). These are software call times: they do not measure the
+physical reset edge or the rail. Taking the timestamps adds a little time to every step; nothing is printed inside
+the loop. Normal and debug builds carry the same instrumentation, outside the ADC code.
 
 ## What it showed on one bench (2026-11-20)
 

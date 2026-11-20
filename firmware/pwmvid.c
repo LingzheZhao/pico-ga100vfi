@@ -129,28 +129,67 @@ static void card_ctl_init(void) {
 // step loop. The loop blocks for every PMBus write, so a write due at or just
 // before t = 0 used to push the release late by up to one write (measured: pw
 // 36, delay 117, td +81 released at about +59 us; docs/TIMING_DIAGNOSTIC.md).
-// The alarm IRQ runs at the highest priority on core 0, preempting the step
-// loop's busy-wait and polled I2C (and USB), and records the release time.
-static int rst_alarm = -1;
+//
+// The handler is installed directly on the alarm's IRQ (highest priority, core
+// 0) and lives in SRAM with nothing it calls in flash: gpio_set_dir and
+// time_us_32 are inline register accesses. push1 used the SDK's alarm
+// dispatcher, which runs from flash; on one bench (2026-11-20) the first alarm
+// of every boot released at +9..+10 us and later shots at 0..2 us, which fits a
+// cold XIP cache. Arming and cancelling still use the SDK calls; the SDK's own
+// dispatcher is never installed for this alarm, so every use ends in
+// rst_alarm_stop() to clear the SDK's pending flag.
+static uint rst_alarm;
 static volatile bool rst_released;
-static volatile uint64_t rst_release_us;
+static volatile uint32_t rst_release_us32;   // time_us_32() when the handler ran
 
-static void rst_release_isr(uint alarm_num) {
-    (void)alarm_num;
+static void __not_in_flash_func(rst_release_isr)(void) {
     gpio_set_dir(PEX_RST_PIN, GPIO_IN);
-    rst_release_us = time_us_64();
+    rst_release_us32 = time_us_32();
+    // Acknowledge the alarm; the SDK has no call for this outside its own handler.
+    PICO_DEFAULT_TIMER_INSTANCE()->intr = 1u << rst_alarm;
     rst_released = true;
 }
 
 static void rst_alarm_init(void) {
-    rst_alarm = hardware_alarm_claim_unused(true);
-    hardware_alarm_set_callback((uint)rst_alarm, rst_release_isr);
-    irq_set_priority(hardware_alarm_get_irq_num((uint)rst_alarm), PICO_HIGHEST_IRQ_PRIORITY);
+    rst_alarm = (uint)hardware_alarm_claim_unused(true);
+    uint irq = hardware_alarm_get_irq_num(rst_alarm);
+    irq_set_exclusive_handler(irq, rst_release_isr);
+    irq_set_priority(irq, PICO_HIGHEST_IRQ_PRIORITY);
+    hw_set_bits(&PICO_DEFAULT_TIMER_INSTANCE()->inte, 1u << rst_alarm);
+    irq_set_enabled(irq, true);
 }
 
+// Disarm and drop a fire that raced the cancel (the alarm interrupt is level:
+// the INTR bit has to go as well as the NVIC pending bit). Call with
+// interrupts disabled when the outcome matters.
+static void rst_alarm_stop(void) {
+    hardware_alarm_cancel(rst_alarm);
+    PICO_DEFAULT_TIMER_INSTANCE()->intr = 1u << rst_alarm;
+    irq_clear(hardware_alarm_get_irq_num(rst_alarm));
+}
+
+// Throwaway alarm before every shot. The handler only sets PEX_RST to input,
+// its idle state, so this does not touch the card; it exercises the IRQ path
+// right before the real alarm. Returns how late it
+// ran in us, or -1 if it never ran (the shot is then refused).
+static int32_t rst_alarm_prime(void) {
+    rst_released = false;
+    uint64_t t = time_us_64() + 200;
+    bool missed = hardware_alarm_set_target(rst_alarm, from_us_since_boot(t));
+    while (!missed && !rst_released && (int64_t)(time_us_64() - t) < 500)
+        tight_loop_contents();
+    uint32_t irq = save_and_disable_interrupts();
+    rst_alarm_stop();
+    int32_t late = rst_released ? (int32_t)(rst_release_us32 - (uint32_t)t) : -1;
+    rst_released = false;
+    restore_interrupts(irq);
+    return late;
+}
+
+// Output value first, then direction: the pad never drives anything but low.
 static void pulse_low(uint pin, uint32_t ms) {
-    gpio_set_dir(pin, GPIO_OUT);
     gpio_put(pin, 0);
+    gpio_set_dir(pin, GPIO_OUT);
     sleep_ms(ms);
     gpio_set_dir(pin, GPIO_IN);
 }
@@ -162,6 +201,9 @@ static void pulse_low(uint pin, uint32_t ms) {
 
 static bool i2c_up;
 static uint32_t i2c_baud_hz = 100000;
+// Set for the duration of a glitch: a refused bus is reported in the shot's
+// records, not printed in the middle of the timeline.
+static bool i2c_quiet;
 
 static void i2c_pins_float(void) {
     gpio_disable_pulls(I2C_SDA);
@@ -174,7 +216,7 @@ static bool i2c_bring_up(void) {
     if (i2c_up) return true;
     i2c_pins_float();
     if (!gpio_get(I2C_SDA) || !gpio_get(I2C_SCL)) {
-        printf("I2C ERR bus low (GPU off?)\n");
+        if (!i2c_quiet) printf("I2C ERR bus low (GPU off?)\n");
         return false;
     }
     i2c_init(I2C_BUS, i2c_baud_hz);
@@ -202,8 +244,8 @@ static void i2c_cmd(char *line) {
         gpio_init(I2C_SDA);
         gpio_disable_pulls(I2C_SCL);
         gpio_init(I2C_SCL);
-        gpio_set_dir(I2C_SCL, GPIO_OUT);
         gpio_put(I2C_SCL, 0);
+        gpio_set_dir(I2C_SCL, GPIO_OUT);
         printf("I2C SCL held low\n");
         return;
     }
@@ -277,7 +319,12 @@ static bool pmbus_r(uint8_t reg, uint8_t *d, int n) {
     return i2c_read_timeout_us(I2C_BUS, 0x25, d, n, false, I2C_TO_US) == n;
 }
 
+static bool prof_saved_ok;
+
 static void unlock_cmd(void) {
+    // A capture from before this unlock may belong to another card or boot
+    // (the Pico stays powered across both): the next fast shot captures afresh.
+    prof_saved_ok = false;
     uint8_t cml;
     if (!pmbus_r(0x7E, &cml, 1)) { printf("unlock ERR read\n"); return; }
     if (cml & 0x08) { printf("unlock already MATCH (CML 0x%02x)\n", cml); return; }
@@ -338,50 +385,78 @@ static bool profile_apply(bool fast) {
 
 // Glitch `fast` 2..7 writes one subset of the fast profile, to find which
 // register moves an edge: 2 = 0x30 + 0x32, 3 = 0x30, 4 = 0x32, 5 = 0xBA,
-// 6 = 0xB9, 7 = 0x45. 1 is the whole profile (as profile_apply(true)); 0x31 is
-// only in that one (the controller refuses it, STATUS_CML 0x28). The card's
-// own six values are still captured before and restored after every shot.
-static bool profile_apply_fast(int fast) {
-    bool ok = true;
+// 6 = 0xB9, 7 = 0x45. 1 is the whole profile (as profile_apply(true)). Bit i of
+// the mask is PROFILE[i]; only those registers are restored and verified.
+static uint8_t profile_mask(int fast) {
+    uint8_t m = 0;
     for (unsigned i = 0; i < PROFILE_N; i++) {
         uint8_t r = PROFILE[i].reg;
-        bool take = fast == 1
+        if (fast == 1
             || (fast == 2 && (r == 0x30 || r == 0x32))
             || (fast == 3 && r == 0x30) || (fast == 4 && r == 0x32)
             || (fast == 5 && r == 0xBA) || (fast == 6 && r == 0xB9)
-            || (fast == 7 && r == 0x45);
-        if (take) ok &= pmbus_w16(r, PROFILE[i].fast);
+            || (fast == 7 && r == 0x45))
+            m |= (uint8_t)(1u << i);
+    }
+    return m;
+}
+
+// False if any write in the mask failed, except the 0x31 write of the full
+// profile: this controller refuses it (two cards here, STATUS_CML 0x28),
+// whether by NACK or by flag is unrecorded.
+static bool profile_apply_fast(int fast, uint8_t mask) {
+    bool ok = true;
+    for (unsigned i = 0; i < PROFILE_N; i++) {
+        if (!(mask & (1u << i))) continue;
+        bool w = pmbus_w16(PROFILE[i].reg, PROFILE[i].fast);
+        if (!(fast == 1 && PROFILE[i].reg == 0x31)) ok &= w;
     }
     return ok;
 }
 
 // Cards differ from the hard-coded "stock" values in PROFILE (one card here reads
 // 0xBA=0x000e 0xB9=0x0039 0x31=0x1872). Capture the card's own values right before
-// the fast profile and write those back afterwards, instead of the table. Never
-// capture a set that already holds a fast value (an interrupted shot).
+// the fast profile and write those back afterwards, instead of the table. A set that
+// already holds a fast value (an earlier restore failed) is refused, and so is reuse
+// of an older capture: power-cycle the card.
 static uint16_t prof_saved[PROFILE_N];
-static bool prof_saved_ok = false;
 
 static bool profile_capture(void) {
     uint16_t cur[PROFILE_N];
-    bool tainted = false;
+    prof_saved_ok = false;
     for (unsigned i = 0; i < PROFILE_N; i++) {
         uint8_t b[2] = { 0, 0 };
         if (!pmbus_r(PROFILE[i].reg, b, 2)) return false;
         cur[i] = (uint16_t)(b[0] | (b[1] << 8));
-        if (cur[i] == PROFILE[i].fast) tainted = true;
+        if (cur[i] == PROFILE[i].fast) return false;
     }
-    if (tainted) return prof_saved_ok;   // keep the earlier capture, never save fast values
     for (unsigned i = 0; i < PROFILE_N; i++) prof_saved[i] = cur[i];
     prof_saved_ok = true;
     return true;
 }
 
-static bool profile_restore(void) {
+// A refused 0x31 write (see profile_apply_fast) is not a failure here either:
+// profile_verify, which reads every masked register back, is the check.
+static bool profile_restore(uint8_t mask) {
     if (!prof_saved_ok) return false;    // nothing captured: write nothing
     bool ok = true;
-    for (unsigned i = 0; i < PROFILE_N; i++) ok &= pmbus_w16(PROFILE[i].reg, prof_saved[i]);
+    for (unsigned i = 0; i < PROFILE_N; i++) {
+        if (!(mask & (1u << i))) continue;
+        bool w = pmbus_w16(PROFILE[i].reg, prof_saved[i]);
+        if (PROFILE[i].reg != 0x31) ok &= w;
+    }
     return ok;
+}
+
+// Read back the masked registers against the capture.
+static bool profile_verify(uint8_t mask) {
+    if (!prof_saved_ok) return false;
+    for (unsigned i = 0; i < PROFILE_N; i++) {
+        if (!(mask & (1u << i))) continue;
+        uint8_t b[2] = { 0, 0 };
+        if (!pmbus_r(PROFILE[i].reg, b, 2) || (uint16_t)(b[0] | (b[1] << 8)) != prof_saved[i]) return false;
+    }
+    return true;
 }
 
 static void profile_cmd(bool fast) {
@@ -394,7 +469,7 @@ static void profile_cmd(bool fast) {
     } else {
         if (!prof_saved_ok) { printf("profile restore: nothing captured, nothing written\n"); return; }
         printf("profile restore:");
-        profile_restore();
+        profile_restore(profile_mask(1));
     }
     for (unsigned i = 0; i < PROFILE_N; i++) {
         uint8_t b[2] = { 0, 0 };
@@ -509,31 +584,60 @@ static void trace_dump(int n) { (void)n; printf("trace: built without DEBUG\n");
 #define GA_SCL_REL 6
 #define GA_MODE_ON 7
 #define GA_VMIN    8
+#define GA_VOUT_RETRY 9   // VOUT write retried for up to VOUT_RETRY_US (after an SCL hold)
 
 #define PMBUS_W_US 36   // ~1 PMBus 16-bit write at 1 MHz
 // Measured call time of one PMBus write on one bench (2026-11-20: ~47 us).
-// Sizes the release-overlap warning only; the pw/gap floor stays 36.
+// Sizes the release-overlap check, the write-spacing warning and the dither
+// step; the plain pw/gap floor stays 36.
 #define PMBUS_W_MEAS_US 47
 // Upper bound on waiting for the release alarm after the timeline ends.
 #define RST_ALARM_GRACE_US 1000
+// The reset assert may start at most one write late; later, an earlier step
+// overran and the reset pulse would no longer be the scheduled one.
+#define RST_LATE_US PMBUS_W_MEAS_US
+// After SCL is released, PMBus traffic waits this long (on one bench a VOUT
+// write 10 us after the release ran inside the SCL rise and failed).
+#define SCL_SETTLE_US 200
+// The stock VOUT write after a hold from the release retries for this long.
+#define VOUT_RETRY_US 500
 
 typedef struct { int32_t t_us; uint8_t act; int32_t arg; } gstep_t;
 typedef struct { int64_t start_us, end_us; bool ok; } gtrace_t;
 static gtrace_t shot_timing[48];
 
-static void scl_hold(bool low) {
+static bool is_pmbus_write(uint8_t act) {
+    return act == GA_VOUT || act == GA_VOUT_RETRY || act == GA_MODE || act == GA_MODE_ON || act == GA_VMIN;
+}
+
+// Hold SCL low, or release it and wait up to SCL_SETTLE_US for it to read
+// high (i2c_bring_up refuses a bus that still reads low): false if it does not.
+static bool scl_hold(bool low) {
     if (low) {
         if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
         gpio_disable_pulls(I2C_SDA);
         gpio_init(I2C_SDA);
         gpio_disable_pulls(I2C_SCL);
         gpio_init(I2C_SCL);
-        gpio_set_dir(I2C_SCL, GPIO_OUT);
         gpio_put(I2C_SCL, 0);
-    } else {
-        gpio_set_dir(I2C_SCL, GPIO_IN);
-        gpio_disable_pulls(I2C_SCL);
+        gpio_set_dir(I2C_SCL, GPIO_OUT);
+        return true;
     }
+    gpio_set_dir(I2C_SCL, GPIO_IN);
+    gpio_disable_pulls(I2C_SCL);
+    absolute_time_t deadline = make_timeout_time_us(SCL_SETTLE_US);
+    while (!gpio_get(I2C_SCL))
+        if (time_reached(deadline)) return false;
+    return true;
+}
+
+static bool pmbus_w16_retry(uint8_t reg, uint16_t v, uint32_t budget_us) {
+    absolute_time_t deadline = make_timeout_time_us(budget_us);
+    while (!pmbus_w16(reg, v)) {
+        if (time_reached(deadline)) return false;
+        busy_wait_us(20);
+    }
+    return true;
 }
 
 static int mv_to_code(int mv) { return (int)(mv / VID_LSB_MV + 0.5f); }
@@ -563,6 +667,9 @@ static void glitch_cmd(char *line) {
     // A 16-bit PMBus write is ~36 us at 1 MHz; keep steps from colliding.
     if (pw < PMBUS_W_US) pw = PMBUS_W_US;
     if (gap < PMBUS_W_US) gap = PMBUS_W_US;
+    // A dither writes every pw with no gap: below one measured write the
+    // commands queue up and run late.
+    if (dither && pw < PMBUS_W_MEAS_US) pw = PMBUS_W_MEAS_US;
 
     gstep_t st[48];
     int ns = 0;
@@ -586,7 +693,7 @@ static void glitch_cmd(char *line) {
             t += pw + gap;
         }
     }
-    // PEX_RST release at t = 0 is the hardware alarm armed below, not a step.
+    // PEX_RST release at t = 0 is the hardware alarm armed by the assert step.
 
     // Post-glitch: schedule stock restore after both tv and the pulse train end,
     // so multi-pulse trains are never interrupted mid-dip by VOUT=0x7E.
@@ -594,16 +701,19 @@ static void glitch_cmd(char *line) {
     if (train_end > post) post = train_end + gap;
     // SCL hold: if the train's last write is scheduled before t = 0, the hold
     // starts at the release (keeps the GPU off the bus from its first boot
-    // steps) and the stock restore below waits for the hold to end, so the
-    // rail stays at v_restore meanwhile. A train still writing after t = 0
-    // keeps the hold after the stock restore, as before.
+    // steps) and the stock restore waits SCL_SETTLE_US past the end of the
+    // hold, so the rail stays at v_restore meanwhile. A train still writing
+    // after t = 0 keeps the hold after the stock restore, as before, and the
+    // report says so (hold_at=post plus a WARN line).
     bool hold_at_release = hold_ms > 0 && train_end < 0;
+    int32_t hold_end = 0;   // scheduled SCL release, when there is a hold
     if (hold_at_release) {
+        hold_end = hold_ms * 1000;
         st[ns++] = (gstep_t){ 0, GA_SCL_LOW, 0 };
-        st[ns++] = (gstep_t){ hold_ms * 1000, GA_SCL_REL, 0 };
-        if (hold_ms * 1000 > post) post = hold_ms * 1000;
+        st[ns++] = (gstep_t){ hold_end, GA_SCL_REL, 0 };
+        if (hold_end + SCL_SETTLE_US > post) post = hold_end + SCL_SETTLE_US;
     }
-    st[ns++] = (gstep_t){ post + 10, GA_VOUT, 0x7E };
+    st[ns++] = (gstep_t){ post + 10, hold_at_release ? GA_VOUT_RETRY : GA_VOUT, 0x7E };
     st[ns++] = (gstep_t){ post + 60, GA_VMIN, 0x30 };
     // PWM-VID hand-back (skip with revert=0 for fast campaigns; rail stays in
     // PMBus mode at the stock voltage, which the GA100 runs on fine).
@@ -611,8 +721,9 @@ static void glitch_cmd(char *line) {
         st[ns++] = (gstep_t){ post + PWMVID_SWITCH_DELAY_US, GA_MODE, 0 };
 
     if (hold_ms > 0 && !hold_at_release) {
+        hold_end = post + 100 + hold_ms * 1000;
         st[ns++] = (gstep_t){ post + 100, GA_SCL_LOW, 0 };
-        st[ns++] = (gstep_t){ post + 100 + hold_ms * 1000, GA_SCL_REL, 0 };
+        st[ns++] = (gstep_t){ hold_end, GA_SCL_REL, 0 };
     }
 
     for (int i = 1; i < ns; i++) {
@@ -622,44 +733,59 @@ static void glitch_cmd(char *line) {
         st[j + 1] = k;
     }
 
-    i2c_baud_hz = 1000000;
-    if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
-    if (fast) {
-        if (!profile_capture()) {
-            i2c_baud_hz = 100000;
-            if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
-            printf("glitch ABORT: VRM profile capture failed or tainted (power-cycle the card)\n");
-            return;
+    // Refused geometry, before anything is written: a VOUT step that the 600 mV
+    // setup write overwrites, or a PMBus write in flight across the release.
+    // Writes take ~47 us each and queue behind each other, so the check uses
+    // the queued start, not the scheduled one.
+    {
+        int64_t bus_free = INT64_MIN;
+        for (int i = 0; i < ns; i++) {
+            if (st[i].act == GA_VOUT && st[i].t_us < reset_at) {
+                printf("glitch ABORT: VOUT step at %ld us is overwritten by the setup write at %d us\n",
+                       (long)st[i].t_us, reset_at);
+                return;
+            }
+            if (!is_pmbus_write(st[i].act)) continue;
+            int64_t start = st[i].t_us > bus_free ? st[i].t_us : bus_free;
+            if (start <= 0 && start + PMBUS_W_MEAS_US > 0) {
+                printf("glitch ABORT: PMBus write act=%u scheduled at %ld us runs from %lld us across the "
+                       "PEX_RST release at 0 (one write ~%d us)\n",
+                       (unsigned)st[i].act, (long)st[i].t_us, (long long)start, PMBUS_W_MEAS_US);
+                return;
+            }
+            bus_free = start + PMBUS_W_MEAS_US;
         }
-        profile_apply_fast(fast);
     }
 
-    // pw and gap are the resolved values (after auto-size and the 36 us floor).
-    printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d delay=%d revert=%d"
-           " reset_at=%d dither=%d hold_at=%s\n",
-           vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert, reset_at, (int)dither,
-           hold_ms <= 0 ? "none" : hold_at_release ? "release" : "post");
-    // The 600 mV setup write at reset_at overwrites any VOUT step before it.
-    for (int i = 0; i < ns; i++)
-        if (st[i].act == GA_VOUT && st[i].t_us < reset_at)
-            printf("glitch WARN: VOUT step at %ld us precedes the setup write at %d us and is overwritten\n",
-                   (long)st[i].t_us, reset_at);
-    // A PMBus write in flight at t = 0 used to delay the release; the alarm now
-    // releases on time, but the write still lands on the edge. Flag it.
-    for (int i = 0; i < ns; i++) {
-        uint8_t a = st[i].act;
-        if ((a == GA_VOUT || a == GA_MODE || a == GA_MODE_ON || a == GA_VMIN) &&
-            st[i].t_us <= 0 && st[i].t_us + PMBUS_W_MEAS_US > 0)
-            printf("glitch WARN: PMBus write act=%u at %ld us overlaps the PEX_RST release at 0 (one write ~%d us)\n",
-                   (unsigned)a, (long)st[i].t_us, PMBUS_W_MEAS_US);
+    // From here to the report: no printf (USB traffic around t = 0); a
+    // refused bus goes into the shot's records instead.
+    i2c_quiet = true;
+    i2c_baud_hz = 1000000;
+    if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
+    uint8_t touched = fast ? profile_mask(fast) : 0;
+    const char *abort_why = NULL;
+    bool applied = false;
+    if (fast) {
+        if (!profile_capture()) abort_why = "VRM profile capture failed or tainted (power-cycle the card)";
+        else if (applied = true, !profile_apply_fast(fast, touched)) abort_why = "VRM profile apply failed";
     }
+    int32_t prime_late = abort_why ? -1 : rst_alarm_prime();
+    if (!abort_why && prime_late < 0) abort_why = "the release alarm did not fire in the priming test";
+    if (abort_why) {
+        // Nothing of the timeline ran. Undo a fast profile that was (partly) written.
+        bool restored = !applied || (profile_restore(touched) && profile_verify(touched));
+        i2c_baud_hz = 100000;
+        if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
+        i2c_quiet = false;
+        printf("glitch ABORT: %s%s\n", abort_why, restored ? "" : "; profile restore FAILED, power-cycle the card");
+        return;
+    }
+
     capture_start();
-    // st[0] is the earliest step (always <= -1300 us), so t0 is in the future
-    // and the alarm cannot be missed.
+    // st[0] is the earliest step (always <= -1300 us), so t0 is in the future.
     uint64_t t0 = time_us_64() - (uint64_t)(int64_t)st[0].t_us;
     rst_released = false;
-    hardware_alarm_set_target((uint)rst_alarm, from_us_since_boot(t0));
-    int wfail = 0;
+    int wfail = 0, executed = 0, failed = -1;
     for (int i = 0; i < ns; i++) {
         int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
         while ((int64_t)time_us_64() < want) tight_loop_contents();
@@ -667,38 +793,58 @@ static void glitch_cmd(char *line) {
         bool ok = true;
         switch (st[i].act) {
         case GA_VOUT:    ok = pmbus_w16(0x21, (uint16_t)st[i].arg); break;
+        case GA_VOUT_RETRY: ok = pmbus_w16_retry(0x21, (uint16_t)st[i].arg, VOUT_RETRY_US); break;
         case GA_MODE:    ok = pmbus_w16(0xE1, 0xC2EA); break;
         case GA_MODE_ON: ok = pmbus_w16(0xE1, 0xC2FA); break;
         case GA_VMIN:    ok = pmbus_w16(0x1F, (uint16_t)st[i].arg); break;
         case GA_RST_LOW: {
-            // If an earlier step overran t = 0 the release has already fired;
-            // asserting now would leave the card held in reset.
+            // Assert, then arm the release alarm, with interrupts off: the
+            // alarm can only ever release a pin that is already low. An assert
+            // that starts more than one write late fails the shot.
             uint32_t irq = save_and_disable_interrupts();
-            if (!rst_released) { gpio_set_dir(PEX_RST_PIN, GPIO_OUT); gpio_put(PEX_RST_PIN, 0); }
-            else ok = false;
+            ok = (int64_t)time_us_64() - want <= RST_LATE_US;
+            if (ok) {
+                gpio_put(PEX_RST_PIN, 0);
+                gpio_set_dir(PEX_RST_PIN, GPIO_OUT);
+                ok = !hardware_alarm_set_target(rst_alarm, from_us_since_boot(t0));
+            }
             restore_interrupts(irq);
             break;
         }
         case GA_SCL_LOW: scl_hold(true); break;
-        case GA_SCL_REL: scl_hold(false); break;
+        case GA_SCL_REL: ok = scl_hold(false); break;
         }
         shot_timing[i].end_us = (int64_t)time_us_64() - (int64_t)t0;
         shot_timing[i].ok = ok;
-        if (!ok) wfail++;
+        executed = i + 1;
+        if (!ok) { wfail++; failed = i; break; }   // the rest of the waveform is not the one asked for
     }
-    // A timeline that ends before t = 0 still waits for the release. Then the
-    // alarm is cancelled and the pin released unconditionally, so the card is
-    // never left in reset whatever happened above.
-    while (!rst_released && (int64_t)(time_us_64() - t0) < RST_ALARM_GRACE_US)
-        tight_loop_contents();
+    // Normal end: a timeline that ends before t = 0 still waits for the release.
+    if (failed < 0)
+        while (!rst_released && (int64_t)(time_us_64() - t0) < RST_ALARM_GRACE_US)
+            tight_loop_contents();
     uint32_t irq = save_and_disable_interrupts();
-    hardware_alarm_cancel((uint)rst_alarm);
+    rst_alarm_stop();
     bool rst_by_alarm = rst_released;
-    gpio_set_dir(PEX_RST_PIN, GPIO_IN);
-    if (!rst_by_alarm) rst_release_us = time_us_64();
     restore_interrupts(irq);
+    // Fail closed: the stock rail goes back first, while the card is still in
+    // reset if the release has not happened yet; then PEX_RST is released
+    // unconditionally, so the card is never left in reset.
+    bool safe_vout = true, safe_vmin = true;
+    if (failed >= 0) {
+        scl_hold(false);
+        safe_vout = pmbus_w16(0x21, 0x7E);
+        safe_vmin = pmbus_w16(0x1F, 0x30);
+        wfail += !safe_vout + !safe_vmin;
+    }
+    gpio_set_dir(PEX_RST_PIN, GPIO_IN);
+    uint32_t release_us32 = rst_by_alarm ? rst_release_us32 : time_us_32();
     capture_stop();
-    if (fast) { if (!profile_restore()) wfail++; }
+    // The profile restore waits out the SCL settle time after a hold.
+    if (failed < 0 && hold_ms > 0)
+        while ((int64_t)(time_us_64() - t0) < (int64_t)hold_end + SCL_SETTLE_US) tight_loop_contents();
+    bool prof_ok = !fast || (profile_restore(touched) && profile_verify(touched));
+    if (!prof_ok) wfail++;
     sleep_ms(30);
     i2c_baud_hz = 100000;
     if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
@@ -707,30 +853,61 @@ static void glitch_cmd(char *line) {
     // before the CML read below: STATUS_VOUT, _IOUT, _INPUT, _TEMPERATURE,
     // _OTHER, _MFR_SPECIFIC, STATUS_BYTE (standard PMBus names; the MP2888B
     // mapping is unconfirmed). A healthy shot costs one extra read, no output.
-    uint8_t vb[2] = { 0, 0 };
+    static const uint8_t regs[] = { 0x7A, 0x7B, 0x7C, 0x7D, 0x7F, 0x80, 0x78 };
+    uint8_t vb[2] = { 0, 0 }, sb[sizeof regs] = { 0 };
+    bool sok[sizeof regs] = { false };
     bool vok = pmbus_r(0x8B, vb, 2);
     unsigned rail_code = (unsigned)vb[0] | ((unsigned)vb[1] << 8);
-    if (!vok || rail_code < 500) {
-        static const uint8_t regs[] = { 0x7A, 0x7B, 0x7C, 0x7D, 0x7F, 0x80, 0x78 };
+    bool rail_down = !vok || rail_code < 500;
+    if (rail_down)
+        for (unsigned i = 0; i < sizeof regs; i++) sok[i] = pmbus_r(regs[i], &sb[i], 1);
+    uint8_t cml = 0, e1[2] = { 0, 0 };
+    pmbus_r(0x7E, &cml, 1);
+    pmbus_r(0xE1, e1, 2);
+    i2c_quiet = false;
+
+    // Report. pw and gap are the resolved values (after auto-size and floors).
+    printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d delay=%d revert=%d"
+           " reset_at=%d dither=%d hold_at=%s\n",
+           vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert, reset_at, (int)dither,
+           hold_ms <= 0 ? "none" : hold_at_release ? "release" : "post");
+    if (hold_ms > 0 && !hold_at_release)
+        printf("glitch WARN: hold_at=post: the train writes until %ld us, after the release, so SCL is held "
+               "from %ld us, not from the release\n", (long)train_end, (long)(hold_end - hold_ms * 1000));
+    {
+        int prev = -1;
+        for (int i = 0; i < ns; i++) {
+            if (!is_pmbus_write(st[i].act)) continue;
+            if (prev >= 0 && st[i].t_us - st[prev].t_us < PMBUS_W_MEAS_US)
+                printf("glitch WARN: PMBus writes at %ld and %ld us are %ld us apart (one write ~%d us); "
+                       "the second runs late\n", (long)st[prev].t_us, (long)st[i].t_us,
+                       (long)(st[i].t_us - st[prev].t_us), PMBUS_W_MEAS_US);
+            prev = i;
+        }
+    }
+    if (failed >= 0)
+        printf("glitch FAIL: step i=%d act=%u scheduled=%ld failed; timeline stopped, safe rail vout=%d vmin=%d, "
+               "PEX_RST released\n", failed, (unsigned)st[failed].act, (long)st[failed].t_us,
+               (int)safe_vout, (int)safe_vmin);
+    if (!prof_ok)
+        printf("glitch FAIL: VRM profile restore or readback failed; power-cycle the card\n");
+    if (rail_down) {
         if (vok) printf("rail_code=%u status", rail_code);
         else printf("rail_code=ERR status");
         for (unsigned i = 0; i < sizeof regs; i++) {
-            uint8_t b = 0;
-            if (pmbus_r(regs[i], &b, 1)) printf(" %02x=%02x", regs[i], b);
+            if (sok[i]) printf(" %02x=%02x", regs[i], sb[i]);
             else printf(" %02x=ERR", regs[i]);
         }
         printf("\n");
     }
-    uint8_t cml = 0, e1[2] = { 0, 0 };
-    pmbus_r(0x7E, &cml, 1);
-    pmbus_r(0xE1, e1, 2);
-    for (int i = 0; i < ns; i++)
+    for (int i = 0; i < executed; i++)
         printf("timing i=%d scheduled=%ld act=%u arg=%ld start=%lld end=%lld ok=%d\n",
                i, (long)st[i].t_us, (unsigned)st[i].act, (long)st[i].arg,
                (long long)shot_timing[i].start_us,
                (long long)shot_timing[i].end_us, (int)shot_timing[i].ok);
-    printf("release_at=%lld scheduled=0 via=%s\n",
-           (long long)((int64_t)rst_release_us - (int64_t)t0), rst_by_alarm ? "alarm" : "fallback");
+    printf("prime_at=%ld\n", (long)prime_late);
+    printf("release_at=%ld scheduled=0 via=%s\n", (long)(int32_t)(release_us32 - (uint32_t)t0),
+           rst_by_alarm ? "alarm" : failed >= 0 ? "abort" : "fallback");
 #ifdef DEBUG
     printf("glitch done pwd=%d e1=0x%02x%02x nvvdd=%.4f writes_failed=%d\n",
            !!(cml & 0x08), e1[1], e1[0], nvvdd_v, wfail);
@@ -793,12 +970,15 @@ static void reset_reason(void) {
     watchdog_hw->scratch[0] = 0;
 }
 
-// Core 1: feed the watchdog (the ADC trace is DMA-driven on core 0).
+// Core 1: feed the watchdog (the ADC trace is DMA-driven on core 0). It busy
+// waits: sleep_us() adds an alarm to the default pool every 500 us, and that
+// pool's IRQ runs on core 0 under spin locks with interrupts masked, which can
+// delay the release alarm (SDK pico_time sleep_until).
 static void core1_main(void) {
     while (true) {
         watchdog_update();
         PHASE(1);
-        sleep_us(500);
+        busy_wait_us(500);
     }
 }
 
@@ -849,11 +1029,11 @@ int main(void) {
         else if (c == 'v') {
 #ifdef DEBUG
             nvvdd_refresh();
-            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-push1-debug\n",
+            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-push2-debug\n",
                    clock_get_hz(clk_sys) / 1000000,
                    nvvdd_v, sample_ns, reset_note);
 #else
-            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-push1\n",
+            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-push2\n",
                    clock_get_hz(clk_sys) / 1000000, reset_note);
 #endif
         }
@@ -869,8 +1049,8 @@ int main(void) {
             printf("released\n");
         }
         else if (c == 'j') {
-            gpio_set_dir(PEX_RST_PIN, GPIO_OUT);
             gpio_put(PEX_RST_PIN, 0);
+            gpio_set_dir(PEX_RST_PIN, GPIO_OUT);
             printf("PEX_RST_BUF* HELD low; send 'J' to release\n");
         }
         else if (c == 'J') {
