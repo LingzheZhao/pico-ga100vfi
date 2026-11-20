@@ -336,6 +336,25 @@ static bool profile_apply(bool fast) {
     return ok;
 }
 
+// Glitch `fast` 2..7 writes one subset of the fast profile, to find which
+// register moves an edge: 2 = 0x30 + 0x32, 3 = 0x30, 4 = 0x32, 5 = 0xBA,
+// 6 = 0xB9, 7 = 0x45. 1 is the whole profile (as profile_apply(true)); 0x31 is
+// only in that one (the controller refuses it, STATUS_CML 0x28). The card's
+// own six values are still captured before and restored after every shot.
+static bool profile_apply_fast(int fast) {
+    bool ok = true;
+    for (unsigned i = 0; i < PROFILE_N; i++) {
+        uint8_t r = PROFILE[i].reg;
+        bool take = fast == 1
+            || (fast == 2 && (r == 0x30 || r == 0x32))
+            || (fast == 3 && r == 0x30) || (fast == 4 && r == 0x32)
+            || (fast == 5 && r == 0xBA) || (fast == 6 && r == 0xB9)
+            || (fast == 7 && r == 0x45);
+        if (take) ok &= pmbus_w16(r, PROFILE[i].fast);
+    }
+    return ok;
+}
+
 // Cards differ from the hard-coded "stock" values in PROFILE (one card here reads
 // 0xBA=0x000e 0xB9=0x0039 0x31=0x1872). Capture the card's own values right before
 // the fast profile and write those back afterwards, instead of the table. Never
@@ -524,6 +543,19 @@ static void glitch_cmd(char *line) {
     int pulses = 1, pw = 0, gap = 0, delay = 75, revert = 1;
     sscanf(line + 1, "%d %d %d %d %d %d %d %d %d %d %d %d",
            &vd, &td, &vr, &tr, &tv, &fast, &hold_ms, &pulses, &pw, &gap, &delay, &revert);
+    if (fast < 0 || fast > 7) { printf("glitch ABORT: fast=%d, use 0..7\n", fast); return; }
+    // revert=2: one-VID dither (see the pulse train below); no hand-back.
+    bool dither = revert == 2;
+    if (dither) revert = 0;
+    // t_restore <= -1000 is a longer PEX_RST lead: reset and the 600 mV setup
+    // step move from -1000 to tr, so a long dip that starts before -1000 is not
+    // overwritten by the setup write. tr then sizes an automatic pw as -20 does.
+    int reset_at = -1000;
+    if (tr <= -1000) {
+        if (tr < -20000) { printf("glitch ABORT: reset lead %d us, use -20000..-1000\n", tr); return; }
+        reset_at = tr;
+        tr = -20;
+    }
     if (pulses < 1) pulses = 1;
     if (pulses > 16) pulses = 16;
     if (pw <= 0) pw = (pulses == 1) ? (tr - td) : (tr - td) / (2 * pulses - 1);
@@ -534,17 +566,21 @@ static void glitch_cmd(char *line) {
 
     gstep_t st[48];
     int ns = 0;
-    st[ns++] = (gstep_t){ -1300, GA_VMIN, 0x20 };
-    st[ns++] = (gstep_t){ -1200, GA_MODE_ON, 0 };
-    st[ns++] = (gstep_t){ -1000, GA_RST_LOW, 0 };
-    st[ns++] = (gstep_t){ -1000, GA_VOUT, mv_to_code(600) };
+    st[ns++] = (gstep_t){ reset_at - 300, GA_VMIN, 0x20 };
+    st[ns++] = (gstep_t){ reset_at - 200, GA_MODE_ON, 0 };
+    st[ns++] = (gstep_t){ reset_at, GA_RST_LOW, 0 };
+    st[ns++] = (gstep_t){ reset_at, GA_VOUT, mv_to_code(600) };
     int32_t train_end = 0;
     {
         int32_t t = td;
         for (int p = 0; p < pulses && ns < 40; p++) {
             // The rail responds ~50-80 us after VOUT_COMMAND, so place the dip
             // edges earlier by `delay` to land the trough on target.
-            st[ns++] = (gstep_t){ t - delay, GA_VOUT, mv_to_code(vd) };
+            // Dither: odd pulses are one VID code shallower and there is no
+            // restore (and no gap) between pulses, so the command steps between
+            // the two codes every pw us; v_restore follows the last pulse only.
+            st[ns++] = (gstep_t){ t - delay, GA_VOUT, mv_to_code(vd) + ((dither && (p & 1)) ? 1 : 0) };
+            if (dither && p + 1 < pulses) { t += pw; continue; }
             train_end = t + pw - delay;
             st[ns++] = (gstep_t){ train_end, GA_VOUT, mv_to_code(vr) };
             t += pw + gap;
@@ -556,6 +592,17 @@ static void glitch_cmd(char *line) {
     // so multi-pulse trains are never interrupted mid-dip by VOUT=0x7E.
     int32_t post = tv;
     if (train_end > post) post = train_end + gap;
+    // SCL hold: if the train's last write is scheduled before t = 0, the hold
+    // starts at the release (keeps the GPU off the bus from its first boot
+    // steps) and the stock restore below waits for the hold to end, so the
+    // rail stays at v_restore meanwhile. A train still writing after t = 0
+    // keeps the hold after the stock restore, as before.
+    bool hold_at_release = hold_ms > 0 && train_end < 0;
+    if (hold_at_release) {
+        st[ns++] = (gstep_t){ 0, GA_SCL_LOW, 0 };
+        st[ns++] = (gstep_t){ hold_ms * 1000, GA_SCL_REL, 0 };
+        if (hold_ms * 1000 > post) post = hold_ms * 1000;
+    }
     st[ns++] = (gstep_t){ post + 10, GA_VOUT, 0x7E };
     st[ns++] = (gstep_t){ post + 60, GA_VMIN, 0x30 };
     // PWM-VID hand-back (skip with revert=0 for fast campaigns; rail stays in
@@ -563,7 +610,7 @@ static void glitch_cmd(char *line) {
     if (revert)
         st[ns++] = (gstep_t){ post + PWMVID_SWITCH_DELAY_US, GA_MODE, 0 };
 
-    if (hold_ms > 0) {
+    if (hold_ms > 0 && !hold_at_release) {
         st[ns++] = (gstep_t){ post + 100, GA_SCL_LOW, 0 };
         st[ns++] = (gstep_t){ post + 100 + hold_ms * 1000, GA_SCL_REL, 0 };
     }
@@ -584,11 +631,19 @@ static void glitch_cmd(char *line) {
             printf("glitch ABORT: VRM profile capture failed or tainted (power-cycle the card)\n");
             return;
         }
-        profile_apply(true);
+        profile_apply_fast(fast);
     }
 
-    printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d delay=%d revert=%d\n",
-           vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert);
+    // pw and gap are the resolved values (after auto-size and the 36 us floor).
+    printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d delay=%d revert=%d"
+           " reset_at=%d dither=%d hold_at=%s\n",
+           vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert, reset_at, (int)dither,
+           hold_ms <= 0 ? "none" : hold_at_release ? "release" : "post");
+    // The 600 mV setup write at reset_at overwrites any VOUT step before it.
+    for (int i = 0; i < ns; i++)
+        if (st[i].act == GA_VOUT && st[i].t_us < reset_at)
+            printf("glitch WARN: VOUT step at %ld us precedes the setup write at %d us and is overwritten\n",
+                   (long)st[i].t_us, reset_at);
     // A PMBus write in flight at t = 0 used to delay the release; the alarm now
     // releases on time, but the write still lands on the edge. Flag it.
     for (int i = 0; i < ns; i++) {
@@ -647,6 +702,25 @@ static void glitch_cmd(char *line) {
     sleep_ms(30);
     i2c_baud_hz = 100000;
     if (i2c_up) { i2c_deinit(I2C_BUS); i2c_up = false; }
+    // READ_VOUT is not a fault latch. If the rail is down (below 500, the
+    // runner's CONTROLLER OFF threshold) or unreadable, read the status bytes
+    // before the CML read below: STATUS_VOUT, _IOUT, _INPUT, _TEMPERATURE,
+    // _OTHER, _MFR_SPECIFIC, STATUS_BYTE (standard PMBus names; the MP2888B
+    // mapping is unconfirmed). A healthy shot costs one extra read, no output.
+    uint8_t vb[2] = { 0, 0 };
+    bool vok = pmbus_r(0x8B, vb, 2);
+    unsigned rail_code = (unsigned)vb[0] | ((unsigned)vb[1] << 8);
+    if (!vok || rail_code < 500) {
+        static const uint8_t regs[] = { 0x7A, 0x7B, 0x7C, 0x7D, 0x7F, 0x80, 0x78 };
+        if (vok) printf("rail_code=%u status", rail_code);
+        else printf("rail_code=ERR status");
+        for (unsigned i = 0; i < sizeof regs; i++) {
+            uint8_t b = 0;
+            if (pmbus_r(regs[i], &b, 1)) printf(" %02x=%02x", regs[i], b);
+            else printf(" %02x=ERR", regs[i]);
+        }
+        printf("\n");
+    }
     uint8_t cml = 0, e1[2] = { 0, 0 };
     pmbus_r(0x7E, &cml, 1);
     pmbus_r(0xE1, e1, 2);

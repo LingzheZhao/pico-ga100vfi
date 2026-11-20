@@ -178,7 +178,7 @@ anything you publish.
 | Time | Action |
 |---|---|
 | t = −1300 / −1200 µs | lower `VOUT_MIN` (`0x20`) and enable PMBus control (`E1 = 0xC2FA`) |
-| t = −1000 µs | assert `PEX_RST`; set rail to 600 mV |
+| t = −1000 µs | assert `PEX_RST`; set rail to 600 mV (a `t_restore` ≤ −1000 moves these three rows earlier, see `docs/PROTOCOL.md`) |
 | t = `td − delay` | triple-pulse `VOUT_COMMAND` dips (`pw` µs low, `gap` µs high) |
 | t = 0 µs | release `PEX_RST` (GPU samples fuses around this edge); a hardware alarm does it on time even while a PMBus write is in flight |
 | t = `post` + 10 / +60 µs | restore `VOUT_COMMAND` = `0x7E` (stock) and `VOUT_MIN` = `0x30` |

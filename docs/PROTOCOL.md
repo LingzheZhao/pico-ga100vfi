@@ -17,6 +17,20 @@ back to PWM-VID mode 500 ms after the dip; set `revert=0` to skip that wait and 
 the rail in PMBus mode at the stock voltage — much faster for campaigns (the GA100
 runs fine on the fixed voltage; call `w` to hand back at the end).
 
+Lab knobs (experimental, `fw=lab-psr1-push1`, not run on hardware yet). With
+`fast` 0 or 1, `t_restore` above -1000, `revert` 0 or 1 and `hold_ms` 0 the timeline
+is the same as before:
+
+| Field | Value | Effect |
+|---|---|---|
+| `fast` | 0 / 1 | stock slew / whole fast profile, as before |
+| `fast` | 2..7 | one subset of the fast profile: 2 = `0x30` + `0x32`, 3 = `0x30`, 4 = `0x32`, 5 = `0xBA`, 6 = `0xB9`, 7 = `0x45` (`0x31` only with 1). The card's six values are still captured before and restored after. Other values abort: `glitch ABORT: fast=<n>, use 0..7` |
+| `t_restore_us` | ≤ -1000 | longer `PEX_RST` lead: reset and the 600 mV setup write move from -1000 to `t_restore` (setup writes at `t_restore` - 300 / - 200), so a dip that starts before -1000 is not overwritten. `t_restore` then counts as -20 for an automatic `pw`. Below -20000 aborts: `glitch ABORT: reset lead <n> us, use -20000..-1000` |
+| `revert` | 2 | one-VID dither: odd pulses are one VID code (6.25 mV) shallower than `v_dip`, with no restore and no gap between pulses, so the command steps between the two codes every `pw`; `v_restore` follows the last pulse. No hand-back (as `revert=0`). Keep `pw` at or above one write (~47 µs measured) or the writes run late |
+| `hold_ms` | > 0 | if the train's last write is scheduled before t = 0, SCL is held low from t = 0 for `hold_ms` and the stock restore (`VOUT` `0x7E`, `VOUT_MIN` `0x30`) waits for the hold to end, so the rail stays at `v_restore` meanwhile; a write still in flight at t = 0 delays the hold start. A train that writes after t = 0 keeps the old hold (after the stock restore) |
+
+The 36 µs `pw`/`gap` floor stays; the echo below prints the resolved `pw` and `gap`.
+
 Reaching the Goldilocks fuse state (DSOV=0, CRC_STATUS=0x55, PLMs=0xffffffff) needs a
 **three-pulse** waveform (`pulses=3`) at a **shallow** dip: a single dip, or a deep
 triple pulse (≈335 mV), only reaches the over-glitched CRC=0x00 state (whole block
@@ -37,7 +51,13 @@ link-up, 0 NACKs) at ~5.5 attempts/s (`~181 ms`/shot). `hold_ms`>0 (SCL hold) is
 On entry the firmware echoes the resolved parameters:
 
 ```
-glitch vd=<n> td=<n> vr=<n> tr=<n> tv=<n> fast=<n> hold=<n> pw=<n> gap=<n> delay=<n> revert=<n>
+glitch vd=<n> td=<n> vr=<n> tr=<n> tv=<n> fast=<n> hold=<n> pw=<n> gap=<n> delay=<n> revert=<n> reset_at=<n> dither=<0|1> hold_at=<none|release|post>
+```
+
+Any VOUT step scheduled before the setup write is overwritten by it, and is flagged:
+
+```
+glitch WARN: VOUT step at <signed_us> us precedes the setup write at <reset_at> us and is overwritten
 ```
 
 `PEX_RST` release at t = 0 is not a timeline step: a hardware alarm (highest IRQ
@@ -66,6 +86,16 @@ the time of the unconditional release after the timeline if the alarm did not ru
 
 ```
 release_at=<signed_us> scheduled=0 via=<alarm|fallback>
+```
+
+After the profile restoration and the 30 ms settle the firmware reads READ_VOUT
+(`0x8B`). If it reads below 500 (the runner's CONTROLLER OFF threshold) or fails, it
+reads STATUS_VOUT, _IOUT, _INPUT, _TEMPERATURE, _OTHER, _MFR_SPECIFIC and STATUS_BYTE
+(standard PMBus names; the MP2888B mapping is unconfirmed) before the CML read and
+prints them (`ERR` for a byte that does not read). A healthy shot prints nothing here:
+
+```
+rail_code=<n|ERR> status 7a=<hh> 7b=<hh> 7c=<hh> 7d=<hh> 7f=<hh> 80=<hh> 78=<hh>
 ```
 
 Response (the host waits for the complete newline-terminated `glitch done` line
