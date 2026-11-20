@@ -41,6 +41,16 @@ class PassiveSnapshotTest(unittest.TestCase):
                 self.assertEqual(len(calls), len(values))
                 self.assertIsNone(result["registers"]["DSOV"])
 
+    def test_stops_on_bad0_nonidle_fusectrl_and_unready_gfw(self):
+        for values, state, reason in [([0xE0040000, 0x3FF, 0, 0xBAD00100], "poisoned", "CRC: BAD0"),
+                                      ([0xE0040001], "unknown", "FUSECTRL: unexpected non-idle"),
+                                      ([0xE0040000, 0x302], "booting", "not 0xff")]:
+            with self.subTest(values=values):
+                result, calls = self.run_reads(values)
+                self.assertEqual(result["state"], state)
+                self.assertIn(reason, result["reason"])
+                self.assertEqual(len(calls), len(values))
+
     def test_candidate_is_not_active_validation(self):
         result, _ = self.run_reads([0xE0040000, 0x3FF, 0, 0x55, 0xFFFFFFFF])
         self.assertEqual(result["state"], "candidate")

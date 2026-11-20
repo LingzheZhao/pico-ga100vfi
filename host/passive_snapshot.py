@@ -1,4 +1,8 @@
-"""Read the diagnostic registers without writes, stopping at the first bad read."""
+"""Read the diagnostic registers without writes, stopping at the first bad read.
+
+Stops at a 0xBADF or 0xBAD0 value, an I/O error, an all-ones response (PLM excepted), a FUSECTRL other than the idle
+0xE0040000, a GFW boot status whose low byte is not 0xFF (still booting), or a DSOV other than 0 or 1. The same rules
+are copied into the per-boot runner of the cmp170hx-8gb-vfi-tools repository (tools/runner/bisect_shots.py)."""
 from __future__ import annotations
 
 import argparse
@@ -33,11 +37,17 @@ def observe(read32: Callable[[int], int]) -> dict:
         if value & 0xFFFF0000 == 0xBADF0000:
             result.update(state="poisoned", reason=f"{name}: BADF sentinel")
             return result
+        if value >> 20 == 0xBAD:
+            result.update(state="poisoned", reason=f"{name}: BAD0 error read")
+            return result
         if value == 0xFFFFFFFF and name != "PLM":
             result["reason"] = f"{name}: all-ones response"
             return result
-        if name == "GFW" and value & 0xFF == 1:
-            result.update(state="booting", reason="GFW low byte is 0x01")
+        if name == "FUSECTRL" and value != 0xE0040000:
+            result["reason"] = f"FUSECTRL: unexpected non-idle value 0x{value:08x}"
+            return result
+        if name == "GFW" and value & 0xFF != 0xFF:
+            result.update(state="booting", reason=f"GFW low byte is 0x{value & 0xFF:02x}, not 0xff")
             return result
         if name == "DSOV" and value not in (0, 1):
             result["reason"] = "DSOV: unexpected value"
