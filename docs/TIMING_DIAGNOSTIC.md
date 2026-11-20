@@ -3,6 +3,10 @@
 This build records when each step of a glitch timeline really ran. `v` reports it as `fw=lab-psr1-timing1`
 (normal build) or `fw=lab-psr1-timing1-debug`.
 
+The experimental build on top of it (`fw=lab-psr1-push1`, `fw=lab-psr1-push1-debug`; not run on hardware yet)
+releases `PEX_RST` from a hardware alarm instead of a timeline step. Its records have no act 4; a
+`release_at=<signed_us> scheduled=0 via=<alarm|fallback>` line follows them.
+
 Each step records the start and end of its call and whether it succeeded, in RAM. After the waveform and the
 profile restore, and before the `glitch done` line, the firmware prints one line per step:
 

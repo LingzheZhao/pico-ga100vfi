@@ -40,6 +40,16 @@ On entry the firmware echoes the resolved parameters:
 glitch vd=<n> td=<n> vr=<n> tr=<n> tv=<n> fast=<n> hold=<n> pw=<n> gap=<n> delay=<n> revert=<n>
 ```
 
+`PEX_RST` release at t = 0 is not a timeline step: a hardware alarm (highest IRQ
+priority, core 0) releases the pin at the scheduled time even while a PMBus write is
+in flight. Before the shot the firmware warns about every scheduled PMBus write whose
+window `[t, t + 47 us)` contains t = 0 (47 us is one write as measured on one bench
+on 2026-11-20; the `pw`/`gap` floor stays 36 us):
+
+```
+glitch WARN: PMBus write act=<n> at <signed_us> us overlaps the PEX_RST release at 0 (one write ~47 us)
+```
+
 The timing diagnostic emits one record per action after the waveform and profile
 restoration, before the completion response:
 
@@ -47,9 +57,16 @@ restoration, before the completion response:
 timing i=<n> scheduled=<signed_us> act=<n> arg=<n> start=<signed_us> end=<signed_us> ok=<0|1>
 ```
 
-Times are relative to the scheduler reference. Reset assertion is act 3; release
-to input is act 4. These measure software call timing, not physical rail or reset
-thresholds. Timestamp overhead perturbs timing. See [TIMING_DIAGNOSTIC.md](TIMING_DIAGNOSTIC.md).
+Times are relative to the scheduler reference. Reset assertion is act 3. These
+measure software call timing, not physical rail or reset thresholds. Timestamp
+overhead perturbs timing. See [TIMING_DIAGNOSTIC.md](TIMING_DIAGNOSTIC.md).
+After the records, one line gives the time the release alarm ran (`via=alarm`), or
+the time of the unconditional release after the timeline if the alarm did not run
+(`via=fallback`; not expected):
+
+```
+release_at=<signed_us> scheduled=0 via=<alarm|fallback>
+```
 
 Response (the host waits for the complete newline-terminated `glitch done` line
 before reading BAR0):
@@ -69,7 +86,7 @@ is the captured-rail average and is **present only in the debug build**
 |---|---|
 | `u` | Unlock the MP2888B (password `0x7C25`) |
 | `z` | Lock status → `cml=0x<hh> pwd=<0|1> e1=0x<hh><hh> vout=0x<hh><hh>` |
-| `v` | Status → debug build: `clk=<n> MHz  nvvdd=<v.vvvv> V  sample_ns=<f>  last reset: <…> fw=lab-psr1-timing1-debug`; normal build: `clk=<n> MHz  last reset: <…> fw=lab-psr1-timing1` |
+| `v` | Status → debug build: `clk=<n> MHz  nvvdd=<v.vvvv> V  sample_ns=<f>  last reset: <…> fw=lab-psr1-push1-debug`; normal build: `clk=<n> MHz  last reset: <…> fw=lab-psr1-push1` |
 | `y` | NVVDD trace → header `trace n=<n> sample_ns=<f>` then `<n>` hex samples; `trace: built without DEBUG` in the normal build |
 | `w` | Revert |
 | `k` / `K` | Apply `fast` / `stock` MP2888B transient-response profile |
@@ -99,6 +116,9 @@ is the captured-rail average and is **present only in the debug build**
 
 - `PEX_RST` is only ever driven **low**, then released to high-Z (the net is 1.8 V
   push-pull; driving it high would put 3.3 V on it).
+- Every glitch timeline ends with the release alarm cancelled and `PEX_RST`
+  released, and the assert step is skipped if the release has already run, so a
+  shot cannot leave the card held in reset.
 - After the dip the firmware restores `VOUT_COMMAND` to the stock code and hands the
   rail back to PWM-VID mode, so an interrupted run cannot leave NVVDD low.
 - The NVVDD ADC is read-only and never gates actuation, so the sense wire

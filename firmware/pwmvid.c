@@ -28,7 +28,10 @@
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/i2c.h"
+#include "hardware/irq.h"
 #include "hardware/structs/qmi.h"
+#include "hardware/sync.h"
+#include "hardware/timer.h"
 #include "hardware/vreg.h"
 #include "hardware/watchdog.h"
 #include "pico/bootrom.h"
@@ -120,6 +123,29 @@ static void card_ctl_init(void) {
     gpio_init(PEX_RST_PIN);
     gpio_disable_pulls(PEX_RST_PIN);
     gpio_set_dir(PEX_RST_PIN, GPIO_IN);
+}
+
+// PEX_RST release at t = 0 comes from a hardware alarm, not from the glitch
+// step loop. The loop blocks for every PMBus write, so a write due at or just
+// before t = 0 used to push the release late by up to one write (measured: pw
+// 36, delay 117, td +81 released at about +59 us; docs/TIMING_DIAGNOSTIC.md).
+// The alarm IRQ runs at the highest priority on core 0, preempting the step
+// loop's busy-wait and polled I2C (and USB), and records the release time.
+static int rst_alarm = -1;
+static volatile bool rst_released;
+static volatile uint64_t rst_release_us;
+
+static void rst_release_isr(uint alarm_num) {
+    (void)alarm_num;
+    gpio_set_dir(PEX_RST_PIN, GPIO_IN);
+    rst_release_us = time_us_64();
+    rst_released = true;
+}
+
+static void rst_alarm_init(void) {
+    rst_alarm = hardware_alarm_claim_unused(true);
+    hardware_alarm_set_callback((uint)rst_alarm, rst_release_isr);
+    irq_set_priority(hardware_alarm_get_irq_num((uint)rst_alarm), PICO_HIGHEST_IRQ_PRIORITY);
 }
 
 static void pulse_low(uint pin, uint32_t ms) {
@@ -441,13 +467,17 @@ static void trace_dump(int n) { (void)n; printf("trace: built without DEBUG\n");
 #define GA_VOUT    1
 #define GA_MODE    2
 #define GA_RST_LOW 3
-#define GA_RST_REL 4
 #define GA_SCL_LOW 5
 #define GA_SCL_REL 6
 #define GA_MODE_ON 7
 #define GA_VMIN    8
 
 #define PMBUS_W_US 36   // ~1 PMBus 16-bit write at 1 MHz
+// Measured call time of one PMBus write on one bench (2026-11-20: ~47 us).
+// Sizes the release-overlap warning only; the pw/gap floor stays 36.
+#define PMBUS_W_MEAS_US 47
+// Upper bound on waiting for the release alarm after the timeline ends.
+#define RST_ALARM_GRACE_US 1000
 
 typedef struct { int32_t t_us; uint8_t act; int32_t arg; } gstep_t;
 typedef struct { int64_t start_us, end_us; bool ok; } gtrace_t;
@@ -501,7 +531,7 @@ static void glitch_cmd(char *line) {
             t += pw + gap;
         }
     }
-    st[ns++] = (gstep_t){ 0, GA_RST_REL, 0 };
+    // PEX_RST release at t = 0 is the hardware alarm armed below, not a step.
 
     // Post-glitch: schedule stock restore after both tv and the pulse train end,
     // so multi-pulse trains are never interrupted mid-dip by VOUT=0x7E.
@@ -540,8 +570,21 @@ static void glitch_cmd(char *line) {
 
     printf("glitch vd=%d td=%d vr=%d tr=%d tv=%d fast=%d hold=%d pw=%d gap=%d delay=%d revert=%d\n",
            vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert);
+    // A PMBus write in flight at t = 0 used to delay the release; the alarm now
+    // releases on time, but the write still lands on the edge. Flag it.
+    for (int i = 0; i < ns; i++) {
+        uint8_t a = st[i].act;
+        if ((a == GA_VOUT || a == GA_MODE || a == GA_MODE_ON || a == GA_VMIN) &&
+            st[i].t_us <= 0 && st[i].t_us + PMBUS_W_MEAS_US > 0)
+            printf("glitch WARN: PMBus write act=%u at %ld us overlaps the PEX_RST release at 0 (one write ~%d us)\n",
+                   (unsigned)a, (long)st[i].t_us, PMBUS_W_MEAS_US);
+    }
     capture_start();
+    // st[0] is the earliest step (always <= -1300 us), so t0 is in the future
+    // and the alarm cannot be missed.
     uint64_t t0 = time_us_64() - (uint64_t)(int64_t)st[0].t_us;
+    rst_released = false;
+    hardware_alarm_set_target((uint)rst_alarm, from_us_since_boot(t0));
     int wfail = 0;
     for (int i = 0; i < ns; i++) {
         int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
@@ -553,8 +596,15 @@ static void glitch_cmd(char *line) {
         case GA_MODE:    ok = pmbus_w16(0xE1, 0xC2EA); break;
         case GA_MODE_ON: ok = pmbus_w16(0xE1, 0xC2FA); break;
         case GA_VMIN:    ok = pmbus_w16(0x1F, (uint16_t)st[i].arg); break;
-        case GA_RST_LOW: gpio_set_dir(PEX_RST_PIN, GPIO_OUT); gpio_put(PEX_RST_PIN, 0); break;
-        case GA_RST_REL: gpio_set_dir(PEX_RST_PIN, GPIO_IN); break;
+        case GA_RST_LOW: {
+            // If an earlier step overran t = 0 the release has already fired;
+            // asserting now would leave the card held in reset.
+            uint32_t irq = save_and_disable_interrupts();
+            if (!rst_released) { gpio_set_dir(PEX_RST_PIN, GPIO_OUT); gpio_put(PEX_RST_PIN, 0); }
+            else ok = false;
+            restore_interrupts(irq);
+            break;
+        }
         case GA_SCL_LOW: scl_hold(true); break;
         case GA_SCL_REL: scl_hold(false); break;
         }
@@ -562,6 +612,17 @@ static void glitch_cmd(char *line) {
         shot_timing[i].ok = ok;
         if (!ok) wfail++;
     }
+    // A timeline that ends before t = 0 still waits for the release. Then the
+    // alarm is cancelled and the pin released unconditionally, so the card is
+    // never left in reset whatever happened above.
+    while (!rst_released && (int64_t)(time_us_64() - t0) < RST_ALARM_GRACE_US)
+        tight_loop_contents();
+    uint32_t irq = save_and_disable_interrupts();
+    hardware_alarm_cancel((uint)rst_alarm);
+    bool rst_by_alarm = rst_released;
+    gpio_set_dir(PEX_RST_PIN, GPIO_IN);
+    if (!rst_by_alarm) rst_release_us = time_us_64();
+    restore_interrupts(irq);
     capture_stop();
     if (fast) { if (!profile_restore()) wfail++; }
     sleep_ms(30);
@@ -575,6 +636,8 @@ static void glitch_cmd(char *line) {
                i, (long)st[i].t_us, (unsigned)st[i].act, (long)st[i].arg,
                (long long)shot_timing[i].start_us,
                (long long)shot_timing[i].end_us, (int)shot_timing[i].ok);
+    printf("release_at=%lld scheduled=0 via=%s\n",
+           (long long)((int64_t)rst_release_us - (int64_t)t0), rst_by_alarm ? "alarm" : "fallback");
 #ifdef DEBUG
     printf("glitch done pwd=%d e1=0x%02x%02x nvvdd=%.4f writes_failed=%d\n",
            !!(cml & 0x08), e1[1], e1[0], nvvdd_v, wfail);
@@ -649,6 +712,7 @@ static void core1_main(void) {
 // --------------------------------------------------------------------- main
 int main(void) {
     card_ctl_init();
+    rst_alarm_init();
     reset_reason();
     clock_init();
     adc_init_capture();
@@ -692,11 +756,11 @@ int main(void) {
         else if (c == 'v') {
 #ifdef DEBUG
             nvvdd_refresh();
-            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-timing1-debug\n",
+            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-push1-debug\n",
                    clock_get_hz(clk_sys) / 1000000,
                    nvvdd_v, sample_ns, reset_note);
 #else
-            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-timing1\n",
+            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-push1\n",
                    clock_get_hz(clk_sys) / 1000000, reset_note);
 #endif
         }
