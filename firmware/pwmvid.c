@@ -289,6 +289,25 @@ static void unlock_cmd(void) {
     pmbus_w16(0x46, 0x1229);
 }
 
+// Runs after unlock_cmd() on every `u`: write reg 0x13 = 0x00 and config ID
+// 0x46 = 0x1229 (stops GPU devinit re-locking the controller, docs/PROTOCOL.md)
+// and read both back. unlock_cmd() returns early when the controller already
+// reports MATCH (it can keep that across a soft-off) and then skipped both
+// writes. Both writes are idempotent.
+static void unlock_config(void) {
+    uint8_t cml = 0, wp = 0x00, cfg[2] = { 0, 0 };
+    bool wok = pmbus_w(0x13, &wp, 1);
+    wok &= pmbus_w16(0x46, 0x1229);
+    bool rwp = pmbus_r(0x13, &wp, 1);
+    bool rcfg = pmbus_r(0x46, cfg, 2);
+    bool rcml = pmbus_r(0x7E, &cml, 1);
+    printf("unlock %s wp=", !rcml ? "ERR" : (cml & 0x08) ? "MATCH" : "LOCKED");
+    if (rwp) printf("%02x", wp); else printf("ERR");
+    printf(" cfg=");
+    if (rcfg) printf("%02x%02x", cfg[1], cfg[0]); else printf("ERR");
+    printf("%s\n", wok ? "" : " write=ERR");
+}
+
 static void lock_status_cmd(void) {
     uint8_t cml, e1[2], v21[2];
     if (!pmbus_r(0x7E, &cml, 1) || !pmbus_r(0xE1, e1, 2) || !pmbus_r(0x21, v21, 2)) {
@@ -764,7 +783,7 @@ int main(void) {
                    clock_get_hz(clk_sys) / 1000000, reset_note);
 #endif
         }
-        else if (c == 'u') unlock_cmd();
+        else if (c == 'u') { unlock_cmd(); unlock_config(); }
         else if (c == 'z') lock_status_cmd();
         else if (c == 'y') trace_dump(0);
         else if (c == 'w') revert_cmd();

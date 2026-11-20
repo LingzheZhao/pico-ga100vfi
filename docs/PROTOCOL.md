@@ -94,6 +94,11 @@ is the captured-rail average and is **present only in the debug build**
 
 `MATCH` in the `u` response means the password was accepted.
 
+Every `u` then writes reg `0x13` = `0x00` and config ID `0x46` = `0x1229`, reads both
+back and prints `unlock <MATCH|LOCKED|ERR> wp=<hh|ERR> cfg=<hhhh|ERR>[ write=ERR]`
+(`unlock MATCH wp=00 cfg=1229` on a healthy controller). Before, both writes were
+skipped when the controller already reported MATCH.
+
 ## PMBus over the bridge
 
 ```
