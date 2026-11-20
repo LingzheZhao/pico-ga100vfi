@@ -62,7 +62,8 @@ class Card:
             chunk = self.s.read(4096)
             if chunk:
                 buf += chunk
-                if until and until in buf.decode(errors="replace"):
+                if until and any(until in line for line in
+                                 buf.decode(errors="replace").split("\n")[:-1]):
                     break
                 last = time.time()
             elif time.time() - last >= wait:

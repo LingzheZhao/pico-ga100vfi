@@ -450,6 +450,8 @@ static void trace_dump(int n) { (void)n; printf("trace: built without DEBUG\n");
 #define PMBUS_W_US 36   // ~1 PMBus 16-bit write at 1 MHz
 
 typedef struct { int32_t t_us; uint8_t act; int32_t arg; } gstep_t;
+typedef struct { int64_t start_us, end_us; bool ok; } gtrace_t;
+static gtrace_t shot_timing[48];
 
 static void scl_hold(bool low) {
     if (low) {
@@ -544,6 +546,7 @@ static void glitch_cmd(char *line) {
     for (int i = 0; i < ns; i++) {
         int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
         while ((int64_t)time_us_64() < want) tight_loop_contents();
+        shot_timing[i].start_us = (int64_t)time_us_64() - (int64_t)t0;
         bool ok = true;
         switch (st[i].act) {
         case GA_VOUT:    ok = pmbus_w16(0x21, (uint16_t)st[i].arg); break;
@@ -555,6 +558,8 @@ static void glitch_cmd(char *line) {
         case GA_SCL_LOW: scl_hold(true); break;
         case GA_SCL_REL: scl_hold(false); break;
         }
+        shot_timing[i].end_us = (int64_t)time_us_64() - (int64_t)t0;
+        shot_timing[i].ok = ok;
         if (!ok) wfail++;
     }
     capture_stop();
@@ -565,6 +570,11 @@ static void glitch_cmd(char *line) {
     uint8_t cml = 0, e1[2] = { 0, 0 };
     pmbus_r(0x7E, &cml, 1);
     pmbus_r(0xE1, e1, 2);
+    for (int i = 0; i < ns; i++)
+        printf("timing i=%d scheduled=%ld act=%u arg=%ld start=%lld end=%lld ok=%d\n",
+               i, (long)st[i].t_us, (unsigned)st[i].act, (long)st[i].arg,
+               (long long)shot_timing[i].start_us,
+               (long long)shot_timing[i].end_us, (int)shot_timing[i].ok);
 #ifdef DEBUG
     printf("glitch done pwd=%d e1=0x%02x%02x nvvdd=%.4f writes_failed=%d\n",
            !!(cml & 0x08), e1[1], e1[0], nvvdd_v, wfail);
@@ -682,11 +692,11 @@ int main(void) {
         else if (c == 'v') {
 #ifdef DEBUG
             nvvdd_refresh();
-            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-debug\n",
+            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-timing1-debug\n",
                    clock_get_hz(clk_sys) / 1000000,
                    nvvdd_v, sample_ns, reset_note);
 #else
-            printf("clk=%u MHz  last reset: %s  fw=lab-psr1\n",
+            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-timing1\n",
                    clock_get_hz(clk_sys) / 1000000, reset_note);
 #endif
         }

@@ -40,7 +40,19 @@ On entry the firmware echoes the resolved parameters:
 glitch vd=<n> td=<n> vr=<n> tr=<n> tv=<n> fast=<n> hold=<n> pw=<n> gap=<n> delay=<n> revert=<n>
 ```
 
-Response (the host waits for the literal `glitch done` before reading BAR0):
+The timing diagnostic emits one record per action after the waveform and profile
+restoration, before the completion response:
+
+```
+timing i=<n> scheduled=<signed_us> act=<n> arg=<n> start=<signed_us> end=<signed_us> ok=<0|1>
+```
+
+Times are relative to the scheduler reference. Reset assertion is act 3; release
+to input is act 4. These measure software call timing, not physical rail or reset
+thresholds. Timestamp overhead perturbs timing. See [TIMING_DIAGNOSTIC.md](TIMING_DIAGNOSTIC.md).
+
+Response (the host waits for the complete newline-terminated `glitch done` line
+before reading BAR0):
 
 ```
 glitch done pwd=<0|1> e1=0x<hhhh> nvvdd=<v.vvvv> writes_failed=<n>
@@ -57,7 +69,7 @@ is the captured-rail average and is **present only in the debug build**
 |---|---|
 | `u` | Unlock the MP2888B (password `0x7C25`) |
 | `z` | Lock status → `cml=0x<hh> pwd=<0|1> e1=0x<hh><hh> vout=0x<hh><hh>` |
-| `v` | Status → debug build: `clk=<n> MHz  nvvdd=<v.vvvv> V  sample_ns=<f>  last reset: <…>`; normal build: `clk=<n> MHz  last reset: <…>` |
+| `v` | Status → debug build: `clk=<n> MHz  nvvdd=<v.vvvv> V  sample_ns=<f>  last reset: <…> fw=lab-psr1-timing1-debug`; normal build: `clk=<n> MHz  last reset: <…> fw=lab-psr1-timing1` |
 | `y` | NVVDD trace → header `trace n=<n> sample_ns=<f>` then `<n>` hex samples; `trace: built without DEBUG` in the normal build |
 | `w` | Revert |
 | `k` / `K` | Apply `fast` / `stock` MP2888B transient-response profile |
