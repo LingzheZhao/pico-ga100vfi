@@ -737,6 +737,14 @@ static void glitch_cmd(char *line) {
     // setup write overwrites, or a PMBus write in flight across the release.
     // Writes take ~47 us each and queue behind each other, so the check uses
     // the queued start, not the scheduled one.
+    // push3 (2026-11-21): a PMBus write in flight across the release is
+    // allowed. The release is the alarm IRQ (highest priority, runs from SRAM)
+    // and every PMBus write runs with interrupts on, so a write in flight cannot
+    // move the release; push2 kept this refusal from before the alarm existed.
+    // The first such write is named after the shot (glitch NOTE) and the
+    // release_at line stays the proof of the release time.
+    int overlap_i = -1;
+    int64_t overlap_start = 0;
     {
         int64_t bus_free = INT64_MIN;
         for (int i = 0; i < ns; i++) {
@@ -747,11 +755,9 @@ static void glitch_cmd(char *line) {
             }
             if (!is_pmbus_write(st[i].act)) continue;
             int64_t start = st[i].t_us > bus_free ? st[i].t_us : bus_free;
-            if (start <= 0 && start + PMBUS_W_MEAS_US > 0) {
-                printf("glitch ABORT: PMBus write act=%u scheduled at %ld us runs from %lld us across the "
-                       "PEX_RST release at 0 (one write ~%d us)\n",
-                       (unsigned)st[i].act, (long)st[i].t_us, (long long)start, PMBUS_W_MEAS_US);
-                return;
+            if (start <= 0 && start + PMBUS_W_MEAS_US > 0 && overlap_i < 0) {
+                overlap_i = i;
+                overlap_start = start;
             }
             bus_free = start + PMBUS_W_MEAS_US;
         }
@@ -871,6 +877,10 @@ static void glitch_cmd(char *line) {
            " reset_at=%d dither=%d hold_at=%s\n",
            vd, td, vr, tr, tv, fast, hold_ms, pw, gap, delay, revert, reset_at, (int)dither,
            hold_ms <= 0 ? "none" : hold_at_release ? "release" : "post");
+    if (overlap_i >= 0)
+        printf("glitch NOTE: push3: PMBus write act=%u scheduled at %ld us ran from %lld us across the "
+               "PEX_RST release at 0 (allowed in push3; release_at is the check)\n",
+               (unsigned)st[overlap_i].act, (long)st[overlap_i].t_us, (long long)overlap_start);
     if (hold_ms > 0 && !hold_at_release)
         printf("glitch WARN: hold_at=post: the train writes until %ld us, after the release, so SCL is held "
                "from %ld us, not from the release\n", (long)train_end, (long)(hold_end - hold_ms * 1000));
@@ -1029,11 +1039,11 @@ int main(void) {
         else if (c == 'v') {
 #ifdef DEBUG
             nvvdd_refresh();
-            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-push2-debug\n",
+            printf("clk=%u MHz  nvvdd=%.4f V  sample_ns=%.1f  last reset: %s  fw=lab-psr1-push3-debug\n",
                    clock_get_hz(clk_sys) / 1000000,
                    nvvdd_v, sample_ns, reset_note);
 #else
-            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-push2\n",
+            printf("clk=%u MHz  last reset: %s  fw=lab-psr1-push3\n",
                    clock_get_hz(clk_sys) / 1000000, reset_note);
 #endif
         }
