@@ -73,7 +73,11 @@ class Bar0:
         return struct.unpack_from("<I", self.mm, off)[0]
 
     def wr32(self, off: int, value: int) -> None:
-        struct.pack_into("<I", self.mm, off, value & 0xFFFFFFFF)
+        # One aligned 32-bit store. struct.pack_into zeroes its destination
+        # before packing, which on this mmap is a write of 0 to the register.
+        mv = memoryview(self.mm)[off:off + 4].cast("I")
+        mv[0] = value & 0xFFFFFFFF
+        mv.release()
 
     def close(self) -> None:
         self.mm.close()
