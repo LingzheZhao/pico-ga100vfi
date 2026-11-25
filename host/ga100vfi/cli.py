@@ -10,7 +10,7 @@ from datetime import datetime
 
 from .adaptive import Planner
 from .bar0 import DEFAULT_BDF, Bar0, brd_serial, restore
-from .classify import classify, snapshot
+from .classify import FUSECTRL, UNREADABLE, _ctrl_idle, _poisoned, classify, snapshot
 from .glitch import Attempt, Card
 
 
@@ -25,11 +25,19 @@ def cmd_classify(args) -> int:
 
 
 def cmd_baseline(args) -> int:
-    if not restore(args.bdf, wait_s=0.5, settle_s=0.0):
-        print(f"{args.bdf}: GPU config space unreachable (0xffffffff)", file=sys.stderr)
-        return 2
-    with Bar0(args.bdf) as bar:
-        print(json.dumps(snapshot(bar), indent=2))
+    """Read-only shadow snapshot: never writes PCI config space and gates on FUSECTRL first."""
+    with Bar0(args.bdf, read_only=True) as bar:
+        ctrl = bar.rd32(FUSECTRL)
+        if not _ctrl_idle(ctrl):
+            print(f"{args.bdf}: refused baseline: FUSECTRL=0x{ctrl:08x} (not IDLE / dead / poisoned)",
+                  file=sys.stderr)
+            return 2
+        snap = snapshot(bar, fail_fast=True)
+        for name, val in snap.items():
+            if _poisoned(val) or val == UNREADABLE:
+                print(f"{args.bdf}: baseline aborted on {name}=0x{val:08x}", file=sys.stderr)
+                return 2
+    print(json.dumps(snap, indent=2))
     return 0
 
 
@@ -47,6 +55,8 @@ def cmd_attempt(args) -> int:
               f"writes_failed={rep.writes_failed}")
         if args.trace:
             print(card.trace())
+        if rep.writes_failed > 0 or "glitch FAIL" in rep.raw:
+            return 1
     return 0
 
 
@@ -60,7 +70,10 @@ def _classify_attempt(v) -> str:
 
     under: dsov=1 (dip too shallow). over: dsov=0 but crc != 0x55 (too deep).
     hit: dsov=0 and crc=0x55 (in the window). goldilocks: all checks pass.
+    lost: controller dead/not-idle/poisoned/faulted.
     """
+    if v.fault is not None:
+        return "lost"
     if v.passed:
         return "goldilocks"
     if v.dsov == 1:
@@ -118,9 +131,8 @@ def cmd_campaign(args) -> int:
                 outcome = "lost"
                 if restore(args.bdf, wait_s=args.restore_wait):
                     with Bar0(args.bdf) as bar:
-                        if bar.rd32(0x00820000) != 0xFFFFFFFF:  # FUSECTRL, not PMC_BOOT_0 (poison-safe)
-                            v = classify(bar)
-                            outcome = _classify_attempt(v)
+                        v = classify(bar)
+                        outcome = _classify_attempt(v)
                 if outcome == "lost":
                     lost += 1
                 else:

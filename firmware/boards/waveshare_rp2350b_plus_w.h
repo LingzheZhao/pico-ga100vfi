@@ -1,0 +1,55 @@
+// Board header for Waveshare RP2350B-Plus-W (RP2350B QFN-80, 16 MiB Flash).
+// Used with: cmake -DPICO_BOARD=waveshare_rp2350b_plus_w -DBOARD_RP2350B=ON ..
+//
+// Ensures the Pico SDK declares RP2350B (PICO_RP2350A=0, 48 GPIOs, ADC on GP40-GP47)
+// and 16 MiB Flash instead of pico2_w's RP2350A (30 GPIOs, 4 MiB Flash).
+#ifndef _BOARDS_WAVESHARE_RP2350B_PLUS_W_H
+#define _BOARDS_WAVESHARE_RP2350B_PLUS_W_H
+
+pico_board_cmake_set(PICO_PLATFORM, rp2350)
+pico_board_cmake_set(PICO_FLASH_SIZE_BYTES, 16777216)
+
+// RP2350B QFN-80 package (48 GPIOs: GP0-GP47, ADC0-ADC7 on GP40-GP47)
+#ifndef PICO_RP2350A
+#define PICO_RP2350A 0
+#endif
+
+// 16 MiB QSPI flash (W25Q128JV)
+#ifndef PICO_FLASH_SIZE_BYTES
+#define PICO_FLASH_SIZE_BYTES (16 * 1024 * 1024)
+#endif
+
+// Standard UART0 / I2C0 / SPI0 defaults
+#ifndef PICO_DEFAULT_UART
+#define PICO_DEFAULT_UART 0
+#endif
+#ifndef PICO_DEFAULT_UART_TX_PIN
+#define PICO_DEFAULT_UART_TX_PIN 0
+#endif
+#ifndef PICO_DEFAULT_UART_RX_PIN
+#define PICO_DEFAULT_UART_RX_PIN 1
+#endif
+
+#ifndef PICO_DEFAULT_I2C
+#define PICO_DEFAULT_I2C 0
+#endif
+#ifndef PICO_DEFAULT_I2C_SDA_PIN
+#define PICO_DEFAULT_I2C_SDA_PIN 0
+#endif
+#ifndef PICO_DEFAULT_I2C_SCL_PIN
+#define PICO_DEFAULT_I2C_SCL_PIN 1
+#endif
+
+#ifndef PICO_XOSC_STARTUP_DELAY_MULTIPLIER
+#define PICO_XOSC_STARTUP_DELAY_MULTIPLIER 64
+#endif
+
+#ifndef PICO_BOOT_STAGE2_CHOOSE_W25Q080
+#define PICO_BOOT_STAGE2_CHOOSE_W25Q080 1
+#endif
+
+#ifndef PICO_FLASH_SPI_CLKDIV
+#define PICO_FLASH_SPI_CLKDIV 2
+#endif
+
+#endif // _BOARDS_WAVESHARE_RP2350B_PLUS_W_H

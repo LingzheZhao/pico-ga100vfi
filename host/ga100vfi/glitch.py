@@ -90,7 +90,13 @@ class Card:
     # --- card commands ---------------------------------------------------
     def unlock(self) -> bool:
         r = self.cmd("u")
-        return "MATCH" in r
+        if "ERR" in r or "LOCKED" in r:
+            return False
+        lines = [ln.strip() for ln in r.splitlines() if ln.strip()]
+        return bool(lines) and any(
+            ln.startswith("unlock MATCH") and "wp=00" in ln and "cfg=1229" in ln
+            for ln in lines
+        )
 
     def lock_status(self) -> tuple[bool, int]:
         r = self.cmd("z")
@@ -101,17 +107,25 @@ class Card:
 
     def attempt(self, a: Attempt) -> Report:
         r = self.cmd(a.command(), wait=0.8, total=20.0, until="glitch done")
+        if "glitch ABORT" in r or "ERR:" in r:
+            raise IOError(r)
         m = re.search(
             r"glitch done pwd=(\d) e1=0x([0-9a-f]{4})"
             r"(?: nvvdd=(-?[\d.]+))? writes_failed=(\d+)", r)
         if not m:
             raise IOError(r)
+        wf = int(m.group(4))
+        if "glitch FAIL" in r and wf == 0:
+            wf = 1
         return Report(bool(int(m.group(1))), int(m.group(2), 16),
                       float(m.group(3)) if m.group(3) else None,
-                      int(m.group(4)), r)
+                      wf, r)
 
     def revert(self) -> str:
-        return self.cmd("w", wait=0.8, total=2.0, until="revert")
+        r = self.cmd("w", wait=0.8, total=2.0, until="revert")
+        if "revert FAIL" in r or "ERR" in r or "PWM-VID restored" not in r:
+            raise IOError(f"revert failed or unconfirmed: {r!r}")
+        return r
 
     def status(self) -> str:
         return self.cmd("v")

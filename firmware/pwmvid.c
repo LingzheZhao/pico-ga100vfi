@@ -194,6 +194,11 @@ static void pulse_low(uint pin, uint32_t ms) {
     gpio_set_dir(pin, GPIO_IN);
 }
 
+// Core-0 liveness timestamp read by Core 1 before feeding the hardware watchdog.
+static volatile uint32_t core0_alive_us;
+static inline void core0_touch(void) { core0_alive_us = time_us_32(); }
+#define CORE0_STALL_US 10000000u
+
 // ------------------------------------------------------------------ GPU I2C
 #define I2C_SDA   PIN_I2C_SDA
 #define I2C_SCL   PIN_I2C_SCL
@@ -269,12 +274,20 @@ static void i2c_cmd(char *line) {
     uint8_t b[32];
     int nb = 0;
     char *p = line + 2, *end;
-    while (nb < (int)sizeof b) {
+    bool parse_err = false;
+    while (true) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') break;
+        if (nb >= (int)sizeof b) { parse_err = true; break; }
         unsigned long v = strtoul(p, &end, 16);
-        if (end == p) break;
+        if (end == p || v > 0xFFul || (*end != '\0' && *end != ' ' && *end != '\t')) {
+            parse_err = true;
+            break;
+        }
         b[nb++] = (uint8_t)v;
         p = end;
     }
+    if (parse_err) { printf("I2C ERR parse\n"); return; }
 
     if (op == 's') {
         printf("I2C scan:");
@@ -348,7 +361,14 @@ static void unlock_config(void) {
     bool rwp = pmbus_r(0x13, &wp, 1);
     bool rcfg = pmbus_r(0x46, cfg, 2);
     bool rcml = pmbus_r(0x7E, &cml, 1);
-    printf("unlock %s wp=", !rcml ? "ERR" : (cml & 0x08) ? "MATCH" : "LOCKED");
+    bool all_ok = wok && rwp && rcfg && rcml
+                  && (cml & 0x08) && (wp == 0x00)
+                  && (cfg[1] == 0x12 && cfg[0] == 0x29);
+    const char *state = all_ok ? "MATCH"
+                      : (!rcml || !wok || !rwp || !rcfg) ? "ERR"
+                      : !(cml & 0x08) ? "LOCKED"
+                      : "ERR";
+    printf("unlock %s wp=", state);
     if (rwp) printf("%02x", wp); else printf("ERR");
     printf(" cfg=");
     if (rcfg) printf("%02x%02x", cfg[1], cfg[0]); else printf("ERR");
@@ -562,8 +582,10 @@ static void nvvdd_refresh(void) {
 static void trace_dump(int n) {
     if (n <= 0 || (uint32_t)n > trace_w) n = (int)trace_w;
     printf("trace n=%d sample_ns=%.1f\n", n, sample_ns);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
+        if ((i & 0x3FF) == 0) core0_alive_us = time_us_32();
         printf("%04x%s", trace[i], (i % 16 == 15) ? "\n" : " ");
+    }
     printf("\n");
 }
 
@@ -643,11 +665,29 @@ static bool pmbus_w16_retry(uint8_t reg, uint16_t v, uint32_t budget_us) {
 static int mv_to_code(int mv) { return (int)(mv / VID_LSB_MV + 0.5f); }
 
 static void glitch_cmd(char *line) {
-    int vd = 325, td = -100, vr = 650, tr = -20, tv = 0, fast = 1, hold_ms = 0;
-    int pulses = 1, pw = 0, gap = 0, delay = 75, revert = 1;
-    sscanf(line + 1, "%d %d %d %d %d %d %d %d %d %d %d %d",
-           &vd, &td, &vr, &tr, &tv, &fast, &hold_ms, &pulses, &pw, &gap, &delay, &revert);
+    int vd = 0, td = 0, vr = 0, tr = 0, tv = 0, fast = 0, hold_ms = 0;
+    int pulses = 0, pw = 0, gap = 0, delay = 0, revert = 0;
+    int consumed = 0;
+    int matched = sscanf(line + 1, "%d %d %d %d %d %d %d %d %d %d %d %d%n",
+                         &vd, &td, &vr, &tr, &tv, &fast, &hold_ms, &pulses, &pw, &gap, &delay, &revert,
+                         &consumed);
+    if (matched != 12) {
+        printf("glitch ABORT: expected 12 integer args, got %d\n", matched < 0 ? 0 : matched);
+        return;
+    }
+    const char *tail = line + 1 + consumed;
+    while (*tail == ' ' || *tail == '\t') tail++;
+    if (*tail != '\0') {
+        printf("glitch ABORT: unexpected trailing tokens in g command\n");
+        return;
+    }
+    if (vd < 200 || vd > 900) { printf("glitch ABORT: vd=%d mV out of range 200..900\n", vd); return; }
+    if (vr < 400 || vr > 950) { printf("glitch ABORT: vr=%d mV out of range 400..950\n", vr); return; }
     if (fast < 0 || fast > 7) { printf("glitch ABORT: fast=%d, use 0..7\n", fast); return; }
+    if (hold_ms < 0 || hold_ms > 5000) { printf("glitch ABORT: hold_ms=%d out of range 0..5000\n", hold_ms); return; }
+    if (pulses < 1 || pulses > 16) { printf("glitch ABORT: pulses=%d out of range 1..16\n", pulses); return; }
+    if (delay < 0 || delay > 500) { printf("glitch ABORT: delay=%d out of range 0..500\n", delay); return; }
+    if (revert < 0 || revert > 2) { printf("glitch ABORT: revert=%d out of range 0..2\n", revert); return; }
     // revert=2: one-VID dither (see the pulse train below); no hand-back.
     bool dither = revert == 2;
     if (dither) revert = 0;
@@ -660,8 +700,6 @@ static void glitch_cmd(char *line) {
         reset_at = tr;
         tr = -20;
     }
-    if (pulses < 1) pulses = 1;
-    if (pulses > 16) pulses = 16;
     if (pw <= 0) pw = (pulses == 1) ? (tr - td) : (tr - td) / (2 * pulses - 1);
     if (gap <= 0) gap = pw;
     // A 16-bit PMBus write is ~36 us at 1 MHz; keep steps from colliding.
@@ -794,7 +832,10 @@ static void glitch_cmd(char *line) {
     int wfail = 0, executed = 0, failed = -1;
     for (int i = 0; i < ns; i++) {
         int64_t want = (int64_t)(t0 + (uint64_t)(int64_t)st[i].t_us);
-        while ((int64_t)time_us_64() < want) tight_loop_contents();
+        while ((int64_t)time_us_64() < want) {
+            core0_touch();
+            tight_loop_contents();
+        }
         shot_timing[i].start_us = (int64_t)time_us_64() - (int64_t)t0;
         bool ok = true;
         switch (st[i].act) {
@@ -868,8 +909,9 @@ static void glitch_cmd(char *line) {
     if (rail_down)
         for (unsigned i = 0; i < sizeof regs; i++) sok[i] = pmbus_r(regs[i], &sb[i], 1);
     uint8_t cml = 0, e1[2] = { 0, 0 };
-    pmbus_r(0x7E, &cml, 1);
-    pmbus_r(0xE1, e1, 2);
+    bool ok_cml = pmbus_r(0x7E, &cml, 1);
+    bool ok_e1 = pmbus_r(0xE1, e1, 2);
+    if (!ok_cml || !ok_e1) wfail++;
     i2c_quiet = false;
 
     // Report. pw and gap are the resolved values (after auto-size and floors).
@@ -901,6 +943,9 @@ static void glitch_cmd(char *line) {
                (int)safe_vout, (int)safe_vmin);
     if (!prof_ok)
         printf("glitch FAIL: VRM profile restore or readback failed; power-cycle the card\n");
+    if (!ok_cml || !ok_e1)
+        printf("glitch FAIL: post-shot PMBus status read failed (cml_ok=%d e1_ok=%d)\n",
+               (int)ok_cml, (int)ok_e1);
     if (rail_down) {
         if (vok) printf("rail_code=%u status", rail_code);
         else printf("rail_code=ERR status");
@@ -929,11 +974,17 @@ static void glitch_cmd(char *line) {
 
 // Restore the stock control path (recovery / hand-back).
 static void revert_cmd(void) {
-    (void)pmbus_w16(0x1F, 0x30);
+    bool vmin_ok = pmbus_w16(0x1F, 0x30);
     bool b = pmbus_w16(0x21, 0x7E);
-    sleep_ms(500);
+    for (int i = 0; i < 10; i++) {
+        core0_touch();
+        sleep_ms(50);
+    }
     bool a = pmbus_w16(0xE1, 0xC2EA);
-    printf("revert vout=%d mode=%d (PWM-VID restored)\n", b, a);
+    if (vmin_ok && b && a)
+        printf("revert vmin=%d vout=%d mode=%d (PWM-VID restored)\n", vmin_ok, b, a);
+    else
+        printf("revert FAIL vmin=%d vout=%d mode=%d\n", vmin_ok, b, a);
 }
 
 // ------------------------------------------------------ watchdog / faults
@@ -980,13 +1031,13 @@ static void reset_reason(void) {
     watchdog_hw->scratch[0] = 0;
 }
 
-// Core 1: feed the watchdog (the ADC trace is DMA-driven on core 0). It busy
-// waits: sleep_us() adds an alarm to the default pool every 500 us, and that
-// pool's IRQ runs on core 0 under spin locks with interrupts masked, which can
-// delay the release alarm (SDK pico_time sleep_until).
+// Core 1: feed the watchdog ONLY while Core 0 is alive (heartbeating core0_alive_us).
+// If Core 0 stalls for > CORE0_STALL_US, Core 1 stops feeding WDT so the RP2350 resets.
 static void core1_main(void) {
     while (true) {
-        watchdog_update();
+        if ((uint32_t)(time_us_32() - core0_alive_us) < CORE0_STALL_US) {
+            watchdog_update();
+        }
         PHASE(1);
         busy_wait_us(500);
     }
@@ -999,12 +1050,16 @@ int main(void) {
     reset_reason();
     clock_init();
     adc_init_capture();
+    core0_touch();
     multicore_launch_core1(core1_main);
     watchdog_enable(WDT_MS, true);
 
     stdio_init_all();
     i2c_pins_float();
-    sleep_ms(1500);
+    for (int i = 0; i < 30; i++) {
+        core0_touch();
+        sleep_ms(50);
+    }
     printf("\npwmvid: %u MHz, wiring: I2C + PEX_RST [lab: card profile save/restore]",
            clock_get_hz(clk_sys) / 1000000);
 #ifdef DEBUG
@@ -1022,20 +1077,29 @@ int main(void) {
 
     char line[96];
     int ll = -1;
+    bool line_overflow = false;
     while (true) {
+        core0_touch();
         int c = getchar_timeout_us(1000);
         if (c == PICO_ERROR_TIMEOUT) continue;
         if (ll >= 0) {
             if (c == '\n' || c == '\r') {
-                line[ll] = 0;
-                if (line[0] == '@') i2c_cmd(line);
-                else if (line[0] == 'g') glitch_cmd(line);
+                if (line_overflow) {
+                    printf("ERR: line too long (rejected)\n");
+                } else {
+                    line[ll] = 0;
+                    if (line[0] == '@') i2c_cmd(line);
+                    else if (line[0] == 'g') glitch_cmd(line);
+                }
                 ll = -1;
+                line_overflow = false;
             } else if (ll < (int)sizeof line - 1) {
                 line[ll++] = (char)c;
+            } else {
+                line_overflow = true;
             }
         }
-        else if (c == '@' || c == 'g') { line[0] = (char)c; ll = 1; }
+        else if (c == '@' || c == 'g') { line[0] = (char)c; ll = 1; line_overflow = false; }
         else if (c == 'v') {
 #ifdef DEBUG
             nvvdd_refresh();
