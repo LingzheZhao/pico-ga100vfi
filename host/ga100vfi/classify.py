@@ -88,11 +88,11 @@ def snapshot(bar) -> dict[str, int]:
 
 
 FUSECTRL = 0x00820000
-POISON_TAG = 0xBADF0000
 
 
 def _poisoned(value: int) -> bool:
-    return (value & 0xFFFF0000) == POISON_TAG
+    """True for any NVIDIA PRI error sentinel 0xBAD0xxxx..0xBADFxxxx."""
+    return ((value >> 20) & 0xFFF) == 0xBAD
 
 
 def classify(bar, baseline: dict[str, int] | None = None, write: bool | None = None) -> Verdict:

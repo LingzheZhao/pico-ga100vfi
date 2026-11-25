@@ -38,6 +38,10 @@ def cmd_attempt(args) -> int:
                 args.t_restore, args.t_revert, args.fast, args.hold_ms,
                 args.pulses, args.pw, args.gap, args.delay, args.revert)
     with Card(args.port) as card:
+        if not args.no_unlock and not _ensure_unlocked(card):
+            print("unlock failed: controller locked until VDD33 cycles",
+                  file=sys.stderr)
+            return 2
         rep = card.attempt(a)
         print(f"pwd={rep.pwd} e1=0x{rep.e1:04x} nvvdd={rep.nvvdd} "
               f"writes_failed={rep.writes_failed}")
@@ -47,9 +51,7 @@ def cmd_attempt(args) -> int:
 
 
 def _ensure_unlocked(card: Card) -> bool:
-    pwd, _ = card.lock_status()
-    if pwd:
-        return True
+    # Always send 'u' so firmware/0007 re-applies 0x13=0x00 and 0x46=0x1229.
     return card.unlock()
 
 
@@ -214,6 +216,8 @@ def main(argv=None) -> int:
                    help="3 for the Goldilocks triple pulse")
     a.add_argument("--pw", type=int, default=0, help="pulse width us (0=auto)")
     a.add_argument("--gap", type=int, default=0, help="gap between pulses us (0=auto)")
+    a.add_argument("--fast", type=int, default=1, help="fast slew profile mode (0=slow, 1=fast)")
+    a.add_argument("--hold-ms", type=int, default=0, help="SCL hold duration ms (keep 0)")
     a.add_argument("--revert", type=int, default=1, choices=(0, 1),
                    help="1=hand back to PWM-VID after dip; 0=stay PMBus (fast campaigns)")
     a.add_argument("--no-unlock", action="store_true")

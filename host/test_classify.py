@@ -102,16 +102,26 @@ class ClassifyTest(unittest.TestCase):
 
     def test_poisoned_dsov_stops_before_any_write(self):
         os.environ["CLASSIFY_WRITE"] = "1"
-        bar = FakeBar(DSOV=0xBADF1701)
+        for bad_dsov in (0xBADF1701, 0xBAD00100):
+            with self.subTest(dsov=hex(bad_dsov)):
+                bar = FakeBar(DSOV=bad_dsov)
+                v = classify(bar)
+                self.assertEqual(bar.log, [("rd", FUSECTRL), ("rd", DSOV)])
+                self.assertEqual(v.dsov, bad_dsov)
+                self.assertEqual((v.priv_mask, v.crc_status, v.fpf_row), (0, 0, UNREADABLE))
+                self.assertEqual(v.shadow, {"DSOV_POISONED": bad_dsov})
+                self.assertFalse(v.passed)
+
+    def test_poisoned_bad0_fusectrl_reads_nothing_else(self):
+        os.environ["CLASSIFY_WRITE"] = "1"
+        bar = FakeBar(FUSECTRL=0xBAD00001)
         v = classify(bar)
-        self.assertEqual(bar.log, [("rd", FUSECTRL), ("rd", DSOV)])
-        self.assertEqual(v.dsov, 0xBADF1701)
-        self.assertEqual((v.priv_mask, v.crc_status, v.fpf_row), (0, 0, UNREADABLE))
-        self.assertEqual(v.shadow, {"DSOV_POISONED": 0xBADF1701})
+        self.assertEqual(bar.log, [("rd", FUSECTRL)])
+        self.assertEqual(v.shadow, {"FUSECTRL_POISONED": 0xBAD00001})
         self.assertFalse(v.passed)
 
     def test_other_bad_dsov_values_are_not_goldilocks(self):
-        for dsov in (2, 0xFFFFFFFF, 0xBAD00100):
+        for dsov in (2, 0xFFFFFFFF):
             with self.subTest(dsov=hex(dsov)):
                 v = classify(FakeBar(DSOV=dsov))
                 self.assertFalse(v.passed)

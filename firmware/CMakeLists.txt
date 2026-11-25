@@ -4,10 +4,10 @@ project(pwmvid C CXX ASM)
 pico_sdk_init()
 
 # Board family: enable at most one (see firmware/board.h).
-#   RP2350A  = Pico 2                       (ADC on GP26-GP29 only)
-#   RP2350B  = Pico 2 W / Waveshare Plus-W  (ADC on GP40-GP47)   <- default
-option(BOARD_RP2350A "Build for RP2350A (Pico 2)" OFF)
-option(BOARD_RP2350B "Build for RP2350B (Pico 2 W / Plus-W)" OFF)
+#   RP2350A  = Official Pico 2 / Pico 2 W   (ADC on GP26-GP29 only)
+#   RP2350B  = Waveshare RP2350B-Plus-W     (ADC on GP40-GP47, GP42=ADC2) <- default
+option(BOARD_RP2350A "Build for RP2350A (Official Pico 2 / Pico 2 W)" OFF)
+option(BOARD_RP2350B "Build for RP2350B (Waveshare RP2350B-Plus-W)" OFF)
 
 # DEBUG: budget oscilloscope build — 400 MHz overclock + NVVDD ADC trace
 # (PIN_NVVDD_ADC in board.h: GP42 on RP2350B, GP26 on RP2350A).
